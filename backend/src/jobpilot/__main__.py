@@ -13,6 +13,10 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from jobpilot.llm import OllamaClient
 
 from alembic import command
 from alembic.config import Config as AlembicConfig
@@ -109,15 +113,56 @@ def cmd_scrape(source: str) -> int:
     return asyncio.run(_run_scrape([source]))
 
 
+async def _configured_llm() -> OllamaClient | None:
+    """Return the configured Ollama client if the server and model are ready."""
+    from jobpilot.llm import OllamaClient
+
+    settings = get_settings()
+    client = OllamaClient(settings.ollama_base_url, settings.ollama_model)
+    if await client.is_available() and await client.has_model():
+        return client
+    return None
+
+
+async def _run_llm_check() -> int:
+    from jobpilot.llm import OllamaClient, OllamaError
+
+    settings = get_settings()
+    client = OllamaClient(settings.ollama_base_url, settings.ollama_model)
+
+    if not await client.is_available():
+        console.print(f"[red]✗[/red] Ollama server unreachable at {settings.ollama_base_url}")
+        console.print("  Start it with: [bold]brew services start ollama[/bold]")
+        return 1
+    console.print(f"[green]✓[/green] Ollama server up at {settings.ollama_base_url}")
+
+    if not await client.has_model():
+        console.print(f"[red]✗[/red] Model {settings.ollama_model} not found")
+        console.print(f"  Pull it with: [bold]ollama pull {settings.ollama_model}[/bold]")
+        return 1
+    console.print(f"[green]✓[/green] Model {settings.ollama_model} available")
+
+    try:
+        reply = await client.generate("Reply with the single word: ready")
+    except OllamaError as exc:
+        console.print(f"[red]✗[/red] Generation failed: {exc}")
+        return 1
+    console.print(f"[green]✓[/green] Generation works (model said: {reply.strip()[:60]!r})")
+    return 0
+
+
 async def _run_resume_import(path: Path, version: str, activate: bool) -> int:
     from jobpilot.database import create_engine, create_session_factory
     from jobpilot.resume import import_resume
 
     settings = get_settings()
     engine = create_engine(settings.database_url)
+    llm = await _configured_llm()
+    if llm is not None:
+        console.print(f"[dim]Using {llm.model} to refine the parse…[/dim]")
     try:
         resume = await import_resume(
-            create_session_factory(engine), path, version=version, activate=activate
+            create_session_factory(engine), path, version=version, activate=activate, llm=llm
         )
     except (FileNotFoundError, ValueError) as exc:
         console.print(f"[red]Error:[/red] {exc}")
@@ -201,6 +246,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     resume_sub.add_parser("list", help="list stored resume versions")
 
+    llm_parser = subparsers.add_parser("llm", help="local LLM management")
+    llm_sub = llm_parser.add_subparsers(dest="llm_command", required=True)
+    llm_sub.add_parser("check", help="verify Ollama server, model, and generation")
+
     args = parser.parse_args(argv)
 
     settings = get_settings()
@@ -218,6 +267,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_run_resume_import(args.path, args.version, not args.no_activate))
     if args.command == "resume" and args.resume_command == "list":
         return asyncio.run(_run_resume_list())
+    if args.command == "llm" and args.llm_command == "check":
+        return asyncio.run(_run_llm_check())
     parser.error("unknown command")
     return 2
 
