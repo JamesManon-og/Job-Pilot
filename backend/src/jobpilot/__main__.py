@@ -335,6 +335,10 @@ def main(argv: list[str] | None = None) -> int:
     rank_parser.add_argument("--top", type=int, default=20)
     rank_parser.add_argument("--min-score", type=int, default=0)
 
+    serve_parser = subparsers.add_parser("serve", help="run the dashboard API server")
+    serve_parser.add_argument("--host", default="127.0.0.1")
+    serve_parser.add_argument("--port", type=int, default=8000)
+
     args = parser.parse_args(argv)
 
     settings = get_settings()
@@ -358,6 +362,13 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_run_match(args.job_id, args.limit))
     if args.command == "rank":
         return asyncio.run(_run_rank(args.top, args.min_score))
+    if args.command == "serve":
+        import uvicorn
+
+        from jobpilot.api.app import create_app
+
+        uvicorn.run(create_app(), host=args.host, port=args.port, log_level="info")
+        return 0
     parser.error("unknown command")
     return 2
 

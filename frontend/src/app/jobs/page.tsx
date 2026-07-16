@@ -1,0 +1,101 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { api, ApiError, Job } from "@/lib/api";
+import { Card, ErrorNote, Loading, PageTitle, timeAgo } from "@/components/ui";
+
+export default function JobsPage() {
+  const [jobs, setJobs] = useState<Job[] | null>(null);
+  const [search, setSearch] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const timer = setTimeout(async () => {
+      try {
+        setJobs(await api.jobs({ search: search || undefined, limit: 100 }));
+        setError(null);
+      } catch (e) {
+        setError(e instanceof ApiError ? e.message : "Backend unreachable");
+      }
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [search]);
+
+  return (
+    <div className="mx-auto max-w-6xl">
+      <PageTitle title="Jobs" subtitle="Everything scraped so far." />
+      {error ? <ErrorNote error={error} /> : null}
+
+      <input
+        value={search}
+        onChange={(e) => setSearch(e.target.value)}
+        placeholder="Search title, company, description…"
+        className="mb-4 w-full max-w-md rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm outline-none placeholder:text-zinc-600 focus:border-zinc-600"
+      />
+
+      {!jobs && !error ? <Loading /> : null}
+      {jobs ? (
+        <Card className="p-0">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-zinc-800 text-left text-xs uppercase tracking-wide text-zinc-500">
+                <th className="px-4 py-2">Title</th>
+                <th className="px-4 py-2">Company</th>
+                <th className="px-4 py-2">Tech</th>
+                <th className="px-4 py-2">Salary</th>
+                <th className="px-4 py-2">Posted</th>
+              </tr>
+            </thead>
+            <tbody>
+              {jobs.map((job) => (
+                <tr key={job.id} className="border-b border-zinc-800/50 last:border-0">
+                  <td className="max-w-72 px-4 py-2">
+                    <a
+                      href={job.application_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="font-medium text-zinc-100 hover:underline"
+                    >
+                      {job.title}
+                    </a>
+                  </td>
+                  <td className="px-4 py-2 text-zinc-400">{job.company}</td>
+                  <td className="max-w-56 px-4 py-2">
+                    <div className="flex flex-wrap gap-1">
+                      {job.technologies.slice(0, 4).map((tech) => (
+                        <span
+                          key={tech}
+                          className="rounded bg-zinc-800 px-1.5 py-0.5 text-xs text-zinc-400"
+                        >
+                          {tech}
+                        </span>
+                      ))}
+                      {job.technologies.length > 4 ? (
+                        <span className="text-xs text-zinc-600">
+                          +{job.technologies.length - 4}
+                        </span>
+                      ) : null}
+                    </div>
+                  </td>
+                  <td className="px-4 py-2 text-zinc-400">
+                    {job.salary_min && job.salary_max
+                      ? `$${(job.salary_min / 1000).toFixed(0)}k–$${(job.salary_max / 1000).toFixed(0)}k`
+                      : "—"}
+                  </td>
+                  <td className="px-4 py-2 text-zinc-500">{timeAgo(job.date_posted)}</td>
+                </tr>
+              ))}
+              {jobs.length === 0 ? (
+                <tr>
+                  <td colSpan={5}>
+                    <Loading label="No jobs found." />
+                  </td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </Card>
+      ) : null}
+    </div>
+  );
+}
