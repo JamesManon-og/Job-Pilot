@@ -70,6 +70,45 @@ def cmd_db_stats() -> int:
     return 0
 
 
+async def _run_scrape(sources: list[str]) -> int:
+    from jobpilot.database import create_engine, create_session_factory
+    from jobpilot.domain.enums import JobSource
+    from jobpilot.domain.models import ScrapeRun
+    from jobpilot.scrapers import ScrapeRunner, all_scrapers
+
+    settings = get_settings()
+    preferences = load_preferences(settings.preferences_path)
+    engine = create_engine(settings.database_url)
+    runner = ScrapeRunner(create_session_factory(engine), preferences)
+
+    targets = list(all_scrapers()) if sources == ["all"] else [JobSource(name) for name in sources]
+    results: list[ScrapeRun] = []
+    for source in targets:
+        results.append(await runner.run(source))
+    await engine.dispose()
+
+    table = Table(title="Scrape results")
+    table.add_column("Source")
+    table.add_column("Status")
+    table.add_column("Found", justify="right")
+    table.add_column("New", justify="right")
+    table.add_column("Error")
+    for run in results:
+        table.add_row(
+            run.source.value,
+            run.status.value,
+            str(run.jobs_found),
+            str(run.jobs_new),
+            run.error or "",
+        )
+    console.print(table)
+    return 0 if all(run.error is None for run in results) else 1
+
+
+def cmd_scrape(source: str) -> int:
+    return asyncio.run(_run_scrape([source]))
+
+
 def cmd_config_show() -> int:
     settings = get_settings()
     preferences = load_preferences(settings.preferences_path)
@@ -93,6 +132,11 @@ def main(argv: list[str] | None = None) -> int:
     config_sub = config_parser.add_subparsers(dest="config_command", required=True)
     config_sub.add_parser("show", help="print resolved settings and preferences")
 
+    scrape_parser = subparsers.add_parser("scrape", help="scrape job sources")
+    scrape_parser.add_argument(
+        "--source", default="all", help="source name (e.g. remoteok) or 'all'"
+    )
+
     args = parser.parse_args(argv)
 
     settings = get_settings()
@@ -104,6 +148,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_db_stats()
     if args.command == "config" and args.config_command == "show":
         return cmd_config_show()
+    if args.command == "scrape":
+        return cmd_scrape(args.source)
     parser.error("unknown command")
     return 2
 
