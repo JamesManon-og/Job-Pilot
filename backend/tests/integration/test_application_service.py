@@ -126,9 +126,7 @@ class TestApplicationService:
 
         # Approve it first
         async with factory() as session:
-            await ApplicationRepository(session).update_status(
-                app.id, ApplicationStatus.APPROVED
-            )
+            await ApplicationRepository(session).update_status(app.id, ApplicationStatus.APPROVED)
             await session.commit()
 
         submitted = await service.submit(app.id)
@@ -156,9 +154,7 @@ class TestApplicationService:
         app = await service.prepare(job_id, resume_id=resume_id)
         assert app.id is not None
         async with factory() as session:
-            await ApplicationRepository(session).update_status(
-                app.id, ApplicationStatus.APPROVED
-            )
+            await ApplicationRepository(session).update_status(app.id, ApplicationStatus.APPROVED)
             await session.commit()
 
         result = await service.submit(app.id)

@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import jobpilot
 from jobpilot.api.deps import AppState
-from jobpilot.api.routers import actions, applications, jobs, matches, scrape_runs, stats
+from jobpilot.api.routers import actions, applications, jobs, matches, review, scrape_runs, stats
 
 
 @asynccontextmanager
@@ -43,4 +43,5 @@ def create_app() -> FastAPI:
     app.include_router(applications.router)
     app.include_router(scrape_runs.router)
     app.include_router(actions.router)
+    app.include_router(review.router)
     return app

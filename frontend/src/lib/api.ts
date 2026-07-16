@@ -104,6 +104,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export interface ReviewItem {
+  application_id: number;
+  job_id: number;
+  title: string;
+  company: string;
+  application_url: string;
+  status: string;
+  cover_letter: string;
+  answers: Record<string, string>;
+  notes: string;
+  created_at: string;
+}
+
 export const api = {
   stats: () => request<Stats>("/api/stats"),
   jobs: (params: { search?: string; source?: string; limit?: number } = {}) => {
@@ -123,4 +136,15 @@ export const api = {
   scrapeRuns: () => request<ScrapeRun[]>("/api/scrape-runs"),
   triggerScrape: () => request<{ status: string; detail: string }>("/api/actions/scrape", { method: "POST" }),
   triggerMatch: () => request<{ status: string; detail: string }>("/api/actions/match", { method: "POST" }),
+  reviewQueue: (status = "pending_review") =>
+    request<ReviewItem[]>(`/api/review?status=${status}`),
+  approveApplication: (id: number) =>
+    request<{ status: string; detail: string }>(`/api/review/${id}/approve`, { method: "POST" }),
+  rejectApplication: (id: number) =>
+    request<{ status: string; detail: string }>(`/api/review/${id}/reject`, { method: "POST" }),
+  editMaterials: (id: number, data: { cover_letter?: string; answers?: Record<string, string> }) =>
+    request<{ status: string; detail: string }>(`/api/review/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(data),
+    }),
 };

@@ -43,9 +43,7 @@ class AutofillProvider(Protocol):
 
 class DailyCapReachedError(Exception):
     def __init__(self, cap: int, submitted_today: int) -> None:
-        super().__init__(
-            f"Daily cap reached: {submitted_today}/{cap} applications submitted today"
-        )
+        super().__init__(f"Daily cap reached: {submitted_today}/{cap} applications submitted today")
         self.cap = cap
         self.submitted_today = submitted_today
 

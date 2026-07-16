@@ -137,8 +137,10 @@ class AutofillEngine:
         return result
 
     async def _fill_text_fields(self, page: Page, result: FilledForm) -> None:
-        inputs = page.locator("input[type='text'], input[type='email'], input[type='tel'], "
-                              "input[type='url'], input[type='number'], input:not([type])")
+        inputs = page.locator(
+            "input[type='text'], input[type='email'], input[type='tel'], "
+            "input[type='url'], input[type='number'], input:not([type])"
+        )
         count = await inputs.count()
 
         for i in range(count):
