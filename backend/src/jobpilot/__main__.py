@@ -370,7 +370,7 @@ async def _run_pipeline(source: str, top: int, min_score: int) -> int:
 
     async with factory() as session:
         resume = await ResumeRepository(session).get_active()
-    if resume is None:
+    if resume is None or resume.id is None:
         console.print("[yellow]No active resume — skipping match/rank/apply.[/yellow]")
         await engine.dispose()
         return 0
