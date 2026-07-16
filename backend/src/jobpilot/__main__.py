@@ -16,7 +16,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
     from jobpilot.llm import OllamaClient
+    from jobpilot.matcher import MatchService
 
 from alembic import command
 from alembic.config import Config as AlembicConfig
@@ -208,6 +211,80 @@ async def _run_resume_list() -> int:
     return 0
 
 
+async def _match_service() -> tuple[MatchService, AsyncEngine]:
+    from jobpilot.database import create_engine, create_session_factory
+    from jobpilot.matcher import MatchEngine, MatchService
+
+    settings = get_settings()
+    llm = await _configured_llm()
+    if llm is None:
+        console.print(
+            "[red]LLM not ready.[/red] Run [bold]jobpilot llm check[/bold] for diagnostics."
+        )
+        raise SystemExit(1)
+    engine = create_engine(settings.database_url)
+    service = MatchService(
+        create_session_factory(engine),
+        MatchEngine(llm, model_name=llm.model),
+        load_preferences(settings.preferences_path),
+    )
+    return service, engine
+
+
+async def _run_match(job_id: int | None, limit: int) -> int:
+    from jobpilot.matcher import NoActiveResumeError
+
+    service, engine = await _match_service()
+    try:
+        if job_id is not None:
+            result = await service.match_one(job_id)
+            results = [result]
+        else:
+            results = await service.match_unscored(limit=limit)
+    except (NoActiveResumeError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        return 1
+    finally:
+        await engine.dispose()
+
+    console.print(f"[green]Scored {len(results)} job(s).[/green]")
+    return 0
+
+
+async def _run_rank(top: int, min_score: int) -> int:
+    from jobpilot.matcher import NoActiveResumeError
+
+    service, engine = await _match_service()
+    try:
+        ranked = await service.ranked(min_score=min_score, top=top)
+    except NoActiveResumeError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        return 1
+    finally:
+        await engine.dispose()
+
+    table = Table(title=f"Top {len(ranked)} matches")
+    table.add_column("Job", justify="right")
+    table.add_column("Title")
+    table.add_column("Company")
+    table.add_column("LLM", justify="right")
+    table.add_column("Composite", justify="right")
+    table.add_column("Recommendation")
+    table.add_column("Missing")
+    for entry in ranked:
+        table.add_row(
+            str(entry.job.id),
+            entry.job.title[:40],
+            entry.job.company[:24],
+            str(entry.match.score),
+            f"{entry.composite_score:.2f}",
+            entry.match.recommendation.value,
+            ", ".join(entry.match.missing_skills[:3]),
+        )
+    console.print(table)
+    return 0
+
+
 def cmd_config_show() -> int:
     settings = get_settings()
     preferences = load_preferences(settings.preferences_path)
@@ -250,6 +327,14 @@ def main(argv: list[str] | None = None) -> int:
     llm_sub = llm_parser.add_subparsers(dest="llm_command", required=True)
     llm_sub.add_parser("check", help="verify Ollama server, model, and generation")
 
+    match_parser = subparsers.add_parser("match", help="score jobs against the active resume")
+    match_parser.add_argument("--job-id", type=int, help="score a single job")
+    match_parser.add_argument("--limit", type=int, default=100, help="max jobs to score")
+
+    rank_parser = subparsers.add_parser("rank", help="show ranked matches")
+    rank_parser.add_argument("--top", type=int, default=20)
+    rank_parser.add_argument("--min-score", type=int, default=0)
+
     args = parser.parse_args(argv)
 
     settings = get_settings()
@@ -269,6 +354,10 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_run_resume_list())
     if args.command == "llm" and args.llm_command == "check":
         return asyncio.run(_run_llm_check())
+    if args.command == "match":
+        return asyncio.run(_run_match(args.job_id, args.limit))
+    if args.command == "rank":
+        return asyncio.run(_run_rank(args.top, args.min_score))
     parser.error("unknown command")
     return 2
 

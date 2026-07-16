@@ -8,6 +8,16 @@ import yaml
 from pydantic import BaseModel, Field
 
 
+class RankingWeights(BaseModel):
+    """Weights for the composite job ranking (see matcher/ranking.py)."""
+
+    resume_match: float = Field(default=0.55, ge=0)
+    salary: float = Field(default=0.10, ge=0)
+    remote: float = Field(default=0.10, ge=0)
+    recency: float = Field(default=0.10, ge=0)
+    tech_overlap: float = Field(default=0.15, ge=0)
+
+
 class UserPreferences(BaseModel):
     """Every knob that controls what gets scraped, matched, and applied to."""
 
@@ -23,6 +33,7 @@ class UserPreferences(BaseModel):
     human_approval_enabled: bool = True
     resume_version: str = "default"
     cover_letter_template: str = "default"
+    ranking_weights: RankingWeights = Field(default_factory=RankingWeights)
 
     def is_company_blacklisted(self, company: str) -> bool:
         normalized = company.strip().lower()
