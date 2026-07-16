@@ -1,1 +1,3 @@
-"""Playwright form autofill (Milestone 9)."""
+from jobpilot.autofill.engine import AutofillEngine, FilledForm
+
+__all__ = ["AutofillEngine", "FilledForm"]

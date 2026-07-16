@@ -18,6 +18,22 @@ class RankingWeights(BaseModel):
     tech_overlap: float = Field(default=0.15, ge=0)
 
 
+class ApplicantProfile(BaseModel):
+    """Personal information for autofilling job applications."""
+
+    name: str = ""
+    email: str = ""
+    phone: str = ""
+    address: str = ""
+    portfolio_url: str = ""
+    github_url: str = ""
+    linkedin_url: str = ""
+    work_authorization: str = ""
+    salary_expectation: str = ""
+    available_start_date: str = ""
+    resume_file: str = ""
+
+
 class UserPreferences(BaseModel):
     """Every knob that controls what gets scraped, matched, and applied to."""
 
@@ -34,6 +50,7 @@ class UserPreferences(BaseModel):
     resume_version: str = "default"
     cover_letter_template: str = "default"
     ranking_weights: RankingWeights = Field(default_factory=RankingWeights)
+    applicant: ApplicantProfile = Field(default_factory=ApplicantProfile)
 
     def is_company_blacklisted(self, company: str) -> bool:
         normalized = company.strip().lower()
