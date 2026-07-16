@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Environment
+.env
+
+# Data & logs (local only)
+data/
+logs/
+
+# Node
+node_modules/
+.next/
+
+# OS
+.DS_Store
