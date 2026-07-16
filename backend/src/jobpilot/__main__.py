@@ -332,6 +332,97 @@ async def _run_apply(job_id: int) -> int:
     return 0
 
 
+async def _run_pipeline(source: str, top: int, min_score: int) -> int:
+    """Full pipeline: scrape → match → rank → prepare applications for top matches."""
+    from jobpilot.applications import ApplicationService, DailyCapReachedError
+    from jobpilot.database import create_engine, create_session_factory
+    from jobpilot.database.repositories import (
+        DuplicateApplicationError,
+        ResumeRepository,
+    )
+    from jobpilot.domain.enums import JobSource
+    from jobpilot.matcher import MatchEngine, MatchService, NoActiveResumeError
+    from jobpilot.scrapers import ScrapeRunner, all_scrapers
+
+    settings = get_settings()
+    preferences = load_preferences(settings.preferences_path)
+    engine = create_engine(settings.database_url)
+    factory = create_session_factory(engine)
+
+    # 1. Scrape
+    console.print("[bold]Step 1/4:[/bold] Scraping jobs…")
+    runner = ScrapeRunner(factory, preferences)
+    targets = list(all_scrapers()) if source == "all" else [JobSource(source)]
+    total_new = 0
+    for src in targets:
+        run = await runner.run(src)
+        console.print(f"  {src.value}: {run.jobs_new} new / {run.jobs_found} found")
+        total_new += run.jobs_new
+    console.print(f"  [green]{total_new} new jobs added.[/green]")
+
+    # 2. Match
+    console.print("[bold]Step 2/4:[/bold] Scoring with LLM…")
+    llm = await _configured_llm()
+    if llm is None:
+        console.print("[yellow]LLM unavailable — skipping match/rank/apply.[/yellow]")
+        await engine.dispose()
+        return 0
+
+    async with factory() as session:
+        resume = await ResumeRepository(session).get_active()
+    if resume is None:
+        console.print("[yellow]No active resume — skipping match/rank/apply.[/yellow]")
+        await engine.dispose()
+        return 0
+
+    match_service = MatchService(factory, MatchEngine(llm, model_name=llm.model), preferences)
+    try:
+        results = await match_service.match_unscored(limit=100)
+    except NoActiveResumeError:
+        console.print("[yellow]No active resume.[/yellow]")
+        await engine.dispose()
+        return 0
+    console.print(f"  [green]Scored {len(results)} jobs.[/green]")
+
+    # 3. Rank
+    console.print("[bold]Step 3/4:[/bold] Ranking…")
+    ranked = await match_service.ranked(min_score=min_score, top=top)
+    if not ranked:
+        console.print("  No matches above threshold.")
+        await engine.dispose()
+        return 0
+    for i, entry in enumerate(ranked, 1):
+        console.print(
+            f"  {i}. {entry.job.title} @ {entry.job.company} (score: {entry.composite_score:.2f})"
+        )
+
+    # 4. Prepare applications
+    console.print("[bold]Step 4/4:[/bold] Preparing applications…")
+    app_service = ApplicationService(factory, preferences, llm=llm)
+    prepared = 0
+    for entry in ranked:
+        assert entry.job.id is not None
+        try:
+            app = await app_service.prepare(entry.job.id, resume_id=resume.id)
+            console.print(
+                f"  [green]Prepared #{app.id}[/green] — {entry.job.title} @ {entry.job.company}"
+            )
+            prepared += 1
+        except DuplicateApplicationError:
+            console.print(f"  [dim]Already applied — {entry.job.title} @ {entry.job.company}[/dim]")
+        except DailyCapReachedError:
+            console.print("  [yellow]Daily cap reached — stopping.[/yellow]")
+            break
+
+    await engine.dispose()
+    console.print(
+        f"\n[bold green]Pipeline complete.[/bold green] {prepared} applications prepared."
+    )
+    if preferences.human_approval_enabled and prepared > 0:
+        console.print("Review them in the dashboard, then approve to submit.")
+    return 0
+
+
 def cmd_config_show() -> int:
     settings = get_settings()
     preferences = load_preferences(settings.preferences_path)
@@ -385,6 +476,11 @@ def main(argv: list[str] | None = None) -> int:
     apply_parser = subparsers.add_parser("apply", help="prepare an application for a job")
     apply_parser.add_argument("job_id", type=int, help="job ID to apply to")
 
+    run_parser = subparsers.add_parser("run", help="full pipeline: scrape → match → rank → prepare")
+    run_parser.add_argument("--source", default="all")
+    run_parser.add_argument("--top", type=int, default=5, help="prepare top N matches")
+    run_parser.add_argument("--min-score", type=int, default=0, help="minimum composite score")
+
     serve_parser = subparsers.add_parser("serve", help="run the dashboard API server")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8000)
@@ -414,6 +510,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_run_rank(args.top, args.min_score))
     if args.command == "apply":
         return asyncio.run(_run_apply(args.job_id))
+    if args.command == "run":
+        return asyncio.run(_run_pipeline(args.source, args.top, args.min_score))
     if args.command == "serve":
         import uvicorn
 
