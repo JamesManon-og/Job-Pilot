@@ -109,6 +109,60 @@ def cmd_scrape(source: str) -> int:
     return asyncio.run(_run_scrape([source]))
 
 
+async def _run_resume_import(path: Path, version: str, activate: bool) -> int:
+    from jobpilot.database import create_engine, create_session_factory
+    from jobpilot.resume import import_resume
+
+    settings = get_settings()
+    engine = create_engine(settings.database_url)
+    try:
+        resume = await import_resume(
+            create_session_factory(engine), path, version=version, activate=activate
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        return 1
+    finally:
+        await engine.dispose()
+
+    profile = resume.profile
+    console.print(f"[green]Imported[/green] {path.name} as version [bold]{version}[/bold]")
+    console.print(f"  Technologies: {', '.join(profile.technologies) or '(none found)'}")
+    console.print(f"  Skills: {len(profile.skills)}  Projects: {len(profile.projects)}")
+    console.print(f"  Years experience: {profile.years_experience or 'unknown'}")
+    console.print(f"  Active: {resume.is_active}")
+    return 0
+
+
+async def _run_resume_list() -> int:
+    from jobpilot.database import create_engine, create_session_factory
+    from jobpilot.database.repositories import ResumeRepository
+
+    settings = get_settings()
+    engine = create_engine(settings.database_url)
+    factory = create_session_factory(engine)
+    async with factory() as session:
+        resumes = await ResumeRepository(session).list()
+    await engine.dispose()
+
+    table = Table(title="Resumes")
+    table.add_column("ID", justify="right")
+    table.add_column("Version")
+    table.add_column("Active")
+    table.add_column("File")
+    table.add_column("Technologies", justify="right")
+    for resume in resumes:
+        table.add_row(
+            str(resume.id),
+            resume.version,
+            "✓" if resume.is_active else "",
+            Path(resume.file_path).name,
+            str(len(resume.profile.technologies)),
+        )
+    console.print(table)
+    return 0
+
+
 def cmd_config_show() -> int:
     settings = get_settings()
     preferences = load_preferences(settings.preferences_path)
@@ -137,6 +191,16 @@ def main(argv: list[str] | None = None) -> int:
         "--source", default="all", help="source name (e.g. remoteok) or 'all'"
     )
 
+    resume_parser = subparsers.add_parser("resume", help="resume management")
+    resume_sub = resume_parser.add_subparsers(dest="resume_command", required=True)
+    resume_import = resume_sub.add_parser("import", help="parse and store a resume PDF")
+    resume_import.add_argument("path", type=Path)
+    resume_import.add_argument("--version", default="default")
+    resume_import.add_argument(
+        "--no-activate", action="store_true", help="do not mark this version active"
+    )
+    resume_sub.add_parser("list", help="list stored resume versions")
+
     args = parser.parse_args(argv)
 
     settings = get_settings()
@@ -150,6 +214,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_config_show()
     if args.command == "scrape":
         return cmd_scrape(args.source)
+    if args.command == "resume" and args.resume_command == "import":
+        return asyncio.run(_run_resume_import(args.path, args.version, not args.no_activate))
+    if args.command == "resume" and args.resume_command == "list":
+        return asyncio.run(_run_resume_list())
     parser.error("unknown command")
     return 2
 
