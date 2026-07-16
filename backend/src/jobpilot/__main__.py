@@ -285,6 +285,53 @@ async def _run_rank(top: int, min_score: int) -> int:
     return 0
 
 
+async def _run_apply(job_id: int) -> int:
+    from jobpilot.applications import ApplicationService, DailyCapReachedError
+    from jobpilot.database import create_engine, create_session_factory
+    from jobpilot.database.repositories import DuplicateApplicationError, ResumeRepository
+
+    settings = get_settings()
+    preferences = load_preferences(settings.preferences_path)
+    engine = create_engine(settings.database_url)
+    factory = create_session_factory(engine)
+
+    async with factory() as session:
+        resume = await ResumeRepository(session).get_active()
+    if resume is None or resume.id is None:
+        console.print("[red]No active resume.[/red] Run: jobpilot resume import <path>")
+        await engine.dispose()
+        return 1
+
+    llm = await _configured_llm()
+    service = ApplicationService(factory, preferences, llm=llm)
+
+    try:
+        application = await service.prepare(job_id, resume_id=resume.id)
+    except DuplicateApplicationError:
+        console.print("[yellow]Already applied to this job.[/yellow]")
+        await engine.dispose()
+        return 1
+    except DailyCapReachedError as exc:
+        console.print(f"[yellow]{exc}[/yellow]")
+        await engine.dispose()
+        return 1
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        await engine.dispose()
+        return 1
+
+    await engine.dispose()
+    console.print(
+        f"[green]Application #{application.id} prepared[/green] "
+        f"(status: {application.status.value})"
+    )
+    if application.cover_letter:
+        console.print(f"[dim]Cover letter: {len(application.cover_letter)} chars[/dim]")
+    if preferences.human_approval_enabled:
+        console.print("Review it in the dashboard, then approve to submit.")
+    return 0
+
+
 def cmd_config_show() -> int:
     settings = get_settings()
     preferences = load_preferences(settings.preferences_path)
@@ -335,6 +382,9 @@ def main(argv: list[str] | None = None) -> int:
     rank_parser.add_argument("--top", type=int, default=20)
     rank_parser.add_argument("--min-score", type=int, default=0)
 
+    apply_parser = subparsers.add_parser("apply", help="prepare an application for a job")
+    apply_parser.add_argument("job_id", type=int, help="job ID to apply to")
+
     serve_parser = subparsers.add_parser("serve", help="run the dashboard API server")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8000)
@@ -362,6 +412,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_run_match(args.job_id, args.limit))
     if args.command == "rank":
         return asyncio.run(_run_rank(args.top, args.min_score))
+    if args.command == "apply":
+        return asyncio.run(_run_apply(args.job_id))
     if args.command == "serve":
         import uvicorn
 

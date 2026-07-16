@@ -116,6 +116,12 @@ class ApplicationRepository:
         await self.log_event(row.id, "status_changed", {"from": previous, "to": status.value})
         return _to_domain(row)
 
+    async def set_screenshot(self, application_id: int, path: str) -> None:
+        row = await self._session.get(ApplicationRow, application_id)
+        if row is not None:
+            row.screenshot_path = path
+            await self._session.flush()
+
     async def count_submitted_since(self, since: datetime) -> int:
         """How many applications were submitted after `since` — powers the daily cap."""
         result = await self._session.scalar(
