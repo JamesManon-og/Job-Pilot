@@ -1,0 +1,19 @@
+<!DOCTYPE html><html><body>
+<h1 class="job-details-jobs-unified-top-card__job-title">Senior React Developer</h1>
+<div class="job-details-jobs-unified-top-card__company-name">Acme Digital Inc.</div>
+<li class="job-details-jobs-unified-top-card__job-insight">Remote · Full-time · Mid-Senior level</li>
+<div class="jobs-description__content"><div id="job-details">We're hiring a React developer to
+build our design system. TypeScript, Next.js.</div></div>
+<button class="jobs-apply-button" aria-label="Easy Apply to Senior React Developer">Easy Apply</button>
+<div class="jobs-easy-apply-modal" hidden>
+  <label for="ln">Full name</label><input id="ln">
+  <label for="le">Email</label><input id="le" type="email">
+  <button aria-label="Continue to next step">Next</button>
+  <button aria-label="Submit application">Submit application</button>
+</div>
+<script>document.querySelector('.jobs-apply-button').addEventListener('click', () => {
+  document.querySelector('.jobs-easy-apply-modal').hidden = false;
+  window.__easyApplyOpened = true; });
+document.querySelector('[aria-label="Submit application"]').addEventListener('click', () => {
+  window.__submitted = true; });</script>
+</body></html>

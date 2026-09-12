@@ -87,6 +87,7 @@ class SearchRunner:
             SearchQuery(
                 keywords=term,
                 location=self._prefs.search.location,
+                remote_only=self._prefs.remote_only,
                 max_results=limit,
                 posted_within_days=self._prefs.search.posted_within_days,
             )

@@ -35,6 +35,7 @@ from jobpilot.scrapers.http import RateLimiter
 class SearchQuery(BaseModel):
     keywords: str = Field(min_length=1)
     location: str = ""
+    remote_only: bool = False
     max_results: int = Field(default=25, ge=1)
     posted_within_days: int | None = None
 
