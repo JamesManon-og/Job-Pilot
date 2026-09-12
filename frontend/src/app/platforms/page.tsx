@@ -20,7 +20,10 @@ export default function PlatformsPage() {
 
       <div className="space-y-3">
         {platforms?.map((platform) => (
-          <Card key={platform.platform} className="flex items-start justify-between gap-4">
+          <Card
+            key={platform.platform}
+            className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between"
+          >
             <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-2">
                 <h3 className="font-medium text-zinc-100">{platform.display_name}</h3>
@@ -41,7 +44,7 @@ export default function PlatformsPage() {
               </p>
             </div>
             {platform.login_command && platform.session_status !== "logged_in" ? (
-              <code className="shrink-0 rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-300">
+              <code className="w-fit whitespace-nowrap rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-300">
                 {platform.login_command}
               </code>
             ) : null}
