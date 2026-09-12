@@ -15,9 +15,7 @@ from bs4 import BeautifulSoup
 
 from jobpilot.domain.enums import JobSource, RemoteType
 from jobpilot.domain.models import Job
-from jobpilot.scrapers.base import BaseScraper
 from jobpilot.scrapers.http import RateLimiter, create_http_client, get_with_retry
-from jobpilot.scrapers.registry import register_scraper
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +83,9 @@ def _parse_entry(entry: dict[str, Any]) -> Job | None:
     )
 
 
-@register_scraper
-class RemoteOKScraper(BaseScraper):
+class RemoteOKScraper:
+    """API client used by platforms.remoteok.RemoteOKAdapter."""
+
     source: ClassVar[JobSource] = JobSource.REMOTEOK
 
     def __init__(self, api_url: str = API_URL) -> None:

@@ -70,6 +70,14 @@ class Job(BaseModel):
     def _blank_id_is_none(cls, value: str | None) -> str | None:
         return value.strip() or None if value is not None else None
 
+    def reidentified(self) -> Job:
+        """A copy with dedup_hash and fingerprint recomputed from current fields.
+
+        pydantic's model_copy(update=...) skips validators, so a job whose title,
+        company, or external_id was changed that way would keep stale identity.
+        """
+        return Job.model_validate({**self.model_dump(), "dedup_hash": "", "fingerprint": ""})
+
     @model_validator(mode="after")
     def _derive_identity(self) -> Job:
         if not self.canonical_url:

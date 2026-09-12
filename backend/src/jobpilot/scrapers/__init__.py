@@ -1,6 +1,6 @@
-from jobpilot.scrapers import remoteok  # noqa: F401 - imported so plugins self-register
-from jobpilot.scrapers.base import BaseScraper
-from jobpilot.scrapers.registry import all_scrapers, get_scraper, register_scraper
-from jobpilot.scrapers.runner import ScrapeRunner
+"""HTTP plumbing and API clients shared by platform adapters (see jobpilot.platforms)."""
 
-__all__ = ["BaseScraper", "ScrapeRunner", "all_scrapers", "get_scraper", "register_scraper"]
+from jobpilot.scrapers.http import RateLimiter, create_http_client, get_with_retry
+from jobpilot.scrapers.remoteok import RemoteOKScraper
+
+__all__ = ["RateLimiter", "RemoteOKScraper", "create_http_client", "get_with_retry"]

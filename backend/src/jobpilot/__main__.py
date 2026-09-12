@@ -14,9 +14,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterable
 from contextlib import AbstractContextManager
-from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -26,9 +24,11 @@ if TYPE_CHECKING:
     from jobpilot.applications.runner import Decision, StaleDecision
     from jobpilot.autofill import FilledForm
     from jobpilot.config import Settings, UserPreferences
-    from jobpilot.domain.models import Application, Job
+    from jobpilot.domain.enums import JobSource, SessionStatus
+    from jobpilot.domain.models import Application, Job, PlatformSession, ScrapeRun
     from jobpilot.llm import OllamaClient
     from jobpilot.matcher import MatchService
+    from jobpilot.platforms import BrowserProfiles
 
 from alembic import command
 from alembic.config import Config as AlembicConfig
@@ -38,14 +38,18 @@ from rich.markup import escape
 from rich.table import Table
 
 from jobpilot.config import PreferencesError, get_settings, load_user_preferences
+from jobpilot.control import AgentPausedError
+from jobpilot.domain.enums import ApplicationStatus
 from jobpilot.locks import PIPELINE_LOCK, LockBusyError, process_lock
 from jobpilot.logging_setup import setup_logging
+from jobpilot.platforms.browser import ProfileInUseError
 
 logger = logging.getLogger(__name__)
 console = Console()
 
 EXIT_CONFIG_ERROR = 2
 EXIT_BUSY = 3
+EXIT_PAUSED = 4
 
 
 def _alembic_config() -> AlembicConfig:
@@ -111,55 +115,311 @@ def cmd_db_stats() -> int:
     return 0
 
 
-async def _run_scrape(source: str) -> int:
-    from jobpilot.database import create_engine, create_session_factory
+def _profiles(*, headless: bool = True) -> BrowserProfiles:
+    from jobpilot.platforms import BrowserProfiles
+
+    settings = get_settings()
+    return BrowserProfiles(
+        settings.profiles_dir,
+        settings.locks_dir,
+        headless=headless,
+        channel=settings.browser_channel,
+    )
+
+
+def _resolve_platforms(name: str, preferences: UserPreferences) -> list[JobSource] | None:
+    """'all' = every platform enabled in config.yaml; a name = that one, even if disabled."""
     from jobpilot.domain.enums import JobSource
-    from jobpilot.domain.models import ScrapeRun
-    from jobpilot.scrapers import ScrapeRunner, all_scrapers
+    from jobpilot.platforms import all_adapter_classes, enabled_platforms
+
+    registered = [p.value for p in all_adapter_classes()]
+    if name == "all":
+        return enabled_platforms(preferences)
+    if name not in registered:
+        console.print(
+            f"[red]Unknown platform {name!r}.[/red] Available: {', '.join(registered)} (or 'all')"
+        )
+        return None
+    return [JobSource(name)]
+
+
+def _ensure_not_paused() -> None:
+    from jobpilot.control import ensure_running
+
+    ensure_running(get_settings().data_dir)
+
+
+async def _run_search(platform: str, headed: bool) -> int:
+    from jobpilot.control import is_paused
+    from jobpilot.database import create_engine, create_session_factory
+    from jobpilot.platforms import SearchRunner
 
     settings = get_settings()
     preferences = _prefs()
-    targets = _resolve_sources(source, all_scrapers())
+    _ensure_not_paused()
+    targets = _resolve_platforms(platform, preferences)
     if targets is None:
         return 1
+    if not targets:
+        console.print(
+            "[yellow]No platforms enabled.[/yellow] Enable some under `platforms:` in "
+            f"{settings.preferences_path} (see `jobpilot platforms`)."
+        )
+        return 1
     engine = create_engine(settings.database_url)
-    runner = ScrapeRunner(create_session_factory(engine), preferences)
+    runner = SearchRunner(
+        create_session_factory(engine),
+        preferences,
+        profiles=_profiles(headless=not headed),
+        paused=lambda: is_paused(settings.data_dir),
+    )
     results: list[ScrapeRun] = []
     try:
         with _pipeline_lock():
             for target in targets:
-                results.append(await runner.run(JobSource(target)))
+                console.print(f"Searching {target.value}…")
+                results.append(await runner.run(target))
     finally:
         await engine.dispose()
 
-    table = Table(title="Scrape results")
-    table.add_column("Source")
+    table = Table(title="Search results")
+    table.add_column("Platform")
     table.add_column("Status")
     table.add_column("Found", justify="right")
     table.add_column("New", justify="right")
+    table.add_column("Known", justify="right")
+    table.add_column("Filtered", justify="right")
     table.add_column("Error")
     for run in results:
+        stats = runner.last_stats.get(run.source)
         table.add_row(
             run.source.value,
             run.status.value,
             str(run.jobs_found),
             str(run.jobs_new),
+            str(stats.known if stats else ""),
+            str(stats.filtered if stats else ""),
             run.error or "",
         )
     console.print(table)
     return 0 if all(run.error is None for run in results) else 1
 
 
-def _resolve_sources(source: str, registered: Iterable[StrEnum]) -> list[str] | None:
-    names = [s.value for s in registered]
-    if source == "all":
-        return names
-    if source not in names:
-        console.print(
-            f"[red]Unknown source {source!r}.[/red] Available: {', '.join(names)} (or 'all')"
+async def _session_rows() -> dict[str, PlatformSession]:
+    from jobpilot.database import create_engine, create_session_factory
+    from jobpilot.database.repositories import PlatformSessionRepository
+
+    engine = create_engine(get_settings().database_url)
+    try:
+        async with create_session_factory(engine)() as session:
+            return {s.platform.value: s for s in await PlatformSessionRepository(session).list()}
+    finally:
+        await engine.dispose()
+
+
+async def _record_session(platform: JobSource, status: SessionStatus, detail: str = "") -> None:
+    from jobpilot.database import create_engine, create_session_factory
+    from jobpilot.database.repositories import PlatformSessionRepository
+
+    engine = create_engine(get_settings().database_url)
+    try:
+        async with create_session_factory(engine)() as session:
+            await PlatformSessionRepository(session).record(platform, status, detail=detail)
+            await session.commit()
+    finally:
+        await engine.dispose()
+
+
+async def _run_platforms() -> int:
+    from jobpilot.platforms import all_adapter_classes
+
+    preferences = _prefs()
+    sessions = await _session_rows()
+    profiles = _profiles()
+    table = Table(title="Platforms")
+    table.add_column("Platform")
+    table.add_column("Enabled")
+    table.add_column("Account")
+    table.add_column("Session")
+    table.add_column("Checked")
+    for platform, cls in all_adapter_classes().items():
+        saved = sessions.get(platform.value)
+        if cls.login_url is None:
+            account, session_text = "not needed", "—"
+        else:
+            account = "saved profile" if profiles.has_profile(platform) else "not logged in"
+            session_text = saved.status.value if saved else "unknown"
+        table.add_row(
+            f"{cls.display_name} ({platform.value})",
+            "✓" if preferences.platform(platform.value).enabled else "",
+            account,
+            session_text,
+            saved.last_checked_at.strftime("%Y-%m-%d %H:%M")
+            if saved and saved.last_checked_at
+            else "",
         )
-        return None
-    return [source]
+    console.print(table)
+    console.print(
+        "[dim]Log in once with `jobpilot login <platform>`, then set "
+        "platforms.<platform>.enabled: true in config.yaml.[/dim]"
+    )
+    return 0
+
+
+async def _run_login(name: str, timeout_minutes: int) -> int:
+    import time
+
+    from jobpilot.domain.enums import JobSource, SessionStatus
+    from jobpilot.platforms import all_adapter_classes
+
+    classes = {p.value: cls for p, cls in all_adapter_classes().items()}
+    if name not in classes:
+        console.print(f"[red]Unknown platform {name!r}.[/red] Available: {', '.join(classes)}")
+        return 1
+    cls = classes[name]
+    platform = JobSource(name)
+    if cls.login_url is None:
+        console.print(f"{cls.display_name} doesn't need an account.")
+        return 0
+    adapter = cls(_prefs().platform(name))
+    console.print(
+        f"Opening {cls.display_name} in a browser window. [bold]Log in yourself[/bold] — "
+        "JobPilot never sees, types, or stores your password. Complete any CAPTCHA or "
+        "verification code yourself. The window closes once you're logged in "
+        f"(or after {timeout_minutes} min)."
+    )
+    async with _profiles(headless=False).open(platform) as browser:
+        page = browser.pages[0] if browser.pages else await browser.new_page()
+        await page.goto(cls.login_url)
+        deadline = time.monotonic() + timeout_minutes * 60
+        while time.monotonic() < deadline and not page.is_closed():
+            try:
+                if await adapter.looks_logged_in(browser, page):
+                    break
+            except Exception:  # noqa: BLE001 - the human is mid-navigation; just poll again
+                pass
+            await asyncio.sleep(2)
+    # Verify from a fresh headless session: proves the cookies were saved.
+    async with _profiles().open(platform) as browser:
+        status = await adapter.session_status(browser)
+    await _record_session(platform, status)
+    if status is SessionStatus.LOGGED_IN:
+        console.print(
+            f"[green]✓ Logged in to {cls.display_name}.[/green] Saved to "
+            f"{_profiles().profile_path(platform)} (owner-only permissions)."
+        )
+        return 0
+    console.print(
+        f"[yellow]{cls.display_name} session: {status.value}.[/yellow] Run "
+        f"`jobpilot login {name}` again when you're ready."
+    )
+    return 1
+
+
+async def _run_logout(name: str, assume_yes: bool) -> int:
+    from jobpilot.domain.enums import JobSource, SessionStatus
+    from jobpilot.platforms import all_adapter_classes
+
+    if name not in {p.value for p in all_adapter_classes()}:
+        console.print(f"[red]Unknown platform {name!r}.[/red]")
+        return 1
+    platform = JobSource(name)
+    profiles = _profiles()
+    if not profiles.has_profile(platform):
+        console.print(f"No saved {name} login.")
+        return 0
+    if not assume_yes:
+        answer = await asyncio.to_thread(
+            console.input,
+            escape(
+                f"Delete JobPilot's saved {name} login ({profiles.profile_path(platform)})? "
+                "Your account itself is not affected. [y/N] > "
+            ),
+        )
+        if answer.strip().lower() != "y":
+            console.print("Kept.")
+            return 0
+    profiles.delete_profile(platform)
+    await _record_session(platform, SessionStatus.NEEDS_LOGIN, "logged out by user")
+    console.print(f"Deleted the saved {name} login.")
+    return 0
+
+
+async def _run_status() -> int:
+    from jobpilot.applications import local_day_start
+    from jobpilot.control import is_paused, pause_reason
+    from jobpilot.database import create_engine, create_session_factory
+    from jobpilot.database.repositories import (
+        ApplicationRepository,
+        JobRepository,
+        ScrapeRunRepository,
+    )
+
+    settings = get_settings()
+    preferences = _prefs()
+    engine = create_engine(settings.database_url)
+    try:
+        async with create_session_factory(engine)() as session:
+            jobs = await JobRepository(session).count_by_status()
+            apps = ApplicationRepository(session)
+            applications = {
+                status.value: len(await apps.list(status=status, limit=10_000))
+                for status in ApplicationStatus
+            }
+            used_today = await apps.count_toward_cap(local_day_start())
+            runs = await ScrapeRunRepository(session).list_recent(limit=20)
+    finally:
+        await engine.dispose()
+    sessions = await _session_rows()
+
+    if is_paused(settings.data_dir):
+        console.print(f"[bold yellow]PAUSED[/bold yellow] {pause_reason(settings.data_dir)}")
+    funnel = Table(title="Pipeline")
+    funnel.add_column("Jobs")
+    funnel.add_column("", justify="right")
+    for status in ("discovered", "matched", "prepared", "applied", "rejected", "skipped"):
+        funnel.add_row(status, str(jobs.get(status, 0)))
+    console.print(funnel)
+    app_table = Table(title="Applications")
+    app_table.add_column("Status")
+    app_table.add_column("", justify="right")
+    for status, count in applications.items():
+        if count:
+            app_table.add_row(status, str(count))
+    console.print(app_table)
+    console.print(
+        f"Today: {used_today}/{preferences.max_applications_per_day} submitted or open "
+        "for submission"
+    )
+    latest: dict[str, ScrapeRun] = {}
+    for run in runs:
+        latest.setdefault(run.source.value, run)
+    for name, run in latest.items():
+        session_state = sessions.get(name)
+        extra = f" · session {session_state.status.value}" if session_state else ""
+        console.print(
+            f"  {name}: last search {run.status.value}, {run.jobs_new} new{extra}"
+            + (f" — [red]{run.error}[/red]" if run.error else "")
+        )
+    return 0
+
+
+def cmd_pause(reason: str) -> int:
+    from jobpilot.control import pause
+
+    pause(get_settings().data_dir, reason)
+    console.print(
+        "[yellow]Paused.[/yellow] Running searches stop at the next listing; nothing new "
+        "starts until `jobpilot unpause`."
+    )
+    return 0
+
+
+def cmd_unpause() -> int:
+    from jobpilot.control import resume
+
+    console.print("Resumed." if resume(get_settings().data_dir) else "Wasn't paused.")
+    return 0
 
 
 async def _configured_llm() -> OllamaClient | None:
@@ -392,32 +652,40 @@ async def _run_prepare(job_id: int) -> int:
     return 0
 
 
-async def _run_pipeline(source: str, top: int, min_score: int) -> int:
-    """Full pipeline: scrape → match → rank → prepare applications for top matches."""
+async def _run_pipeline(platform: str, top: int, min_score: int, headed: bool) -> int:
+    """Full pipeline: search → match → rank → prepare applications for top matches."""
+    from jobpilot.control import is_paused
     from jobpilot.database import create_engine, create_session_factory
-    from jobpilot.domain.enums import JobSource
     from jobpilot.pipeline import PipelineService
-    from jobpilot.scrapers import all_scrapers
+    from jobpilot.platforms import SearchRunner
 
     settings = get_settings()
     preferences = _prefs()
-    targets = _resolve_sources(source, all_scrapers())
+    _ensure_not_paused()
+    targets = _resolve_platforms(platform, preferences)
     if targets is None:
         return 1
     engine = create_engine(settings.database_url)
     factory = create_session_factory(engine)
     llm = await _configured_llm()
-    pipeline = PipelineService(factory, preferences, llm=llm, model_name=llm.model if llm else "")
+    search = SearchRunner(
+        factory,
+        preferences,
+        profiles=_profiles(headless=not headed),
+        paused=lambda: is_paused(settings.data_dir),
+    )
+    pipeline = PipelineService(
+        factory, preferences, llm=llm, model_name=llm.model if llm else "", search=search
+    )
     threshold = max(preferences.min_match_score, min_score)
+    names = ", ".join(t.value for t in targets) or "no platforms enabled"
     console.print(
-        f"[bold]Pipeline[/bold]: scrape {', '.join(targets)} → match → rank "
+        f"[bold]Pipeline[/bold]: search {names} → match → rank "
         f"(LLM score ≥ {threshold}) → prepare top {top}"
     )
     try:
         with _pipeline_lock():
-            report = await pipeline.run(
-                [JobSource(t) for t in targets], top=top, min_score=min_score
-            )
+            report = await pipeline.run(targets, top=top, min_score=min_score)
     finally:
         await engine.dispose()
 
@@ -747,10 +1015,37 @@ def _build_parser() -> argparse.ArgumentParser:
     config_sub = config_parser.add_subparsers(dest="config_command", required=True)
     config_sub.add_parser("show", help="print resolved settings and preferences")
 
-    scrape_parser = subparsers.add_parser("scrape", help="scrape job sources")
-    scrape_parser.add_argument(
-        "--source", default="all", help="source name (e.g. remoteok) or 'all'"
+    for name, help_text in (
+        ("search", "search enabled job platforms"),
+        ("scrape", "alias of search"),
+    ):
+        search_parser = subparsers.add_parser(name, help=help_text)
+        search_parser.add_argument(
+            "--platform",
+            "--source",
+            dest="platform",
+            default="all",
+            help="platform name (e.g. linkedin) or 'all' enabled platforms",
+        )
+        search_parser.add_argument(
+            "--headed", action="store_true", help="show the browser while searching"
+        )
+
+    subparsers.add_parser("platforms", help="list platforms, login state, and settings")
+    login_parser = subparsers.add_parser(
+        "login", help="log in to a platform yourself in a browser window (saved for reuse)"
     )
+    login_parser.add_argument("platform")
+    login_parser.add_argument("--timeout", type=_positive_int, default=10, help="minutes to wait")
+    logout_parser = subparsers.add_parser("logout", help="delete a platform's saved login")
+    logout_parser.add_argument("platform")
+    logout_parser.add_argument("--yes", action="store_true", help="don't ask for confirmation")
+    subparsers.add_parser("status", help="pipeline counts, today's cap, platform sessions")
+    pause_parser = subparsers.add_parser(
+        "pause", help="stop the agent (searches stop, nothing starts)"
+    )
+    pause_parser.add_argument("reason", nargs="*", help="optional note")
+    subparsers.add_parser("unpause", help="undo `jobpilot pause`")
 
     resume_parser = subparsers.add_parser("resume", help="resume management")
     resume_sub = resume_parser.add_subparsers(dest="resume_command", required=True)
@@ -788,8 +1083,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "application_ids", type=int, nargs="*", help="application IDs (default: all approved)"
     )
 
-    run_parser = subparsers.add_parser("run", help="full pipeline: scrape → match → rank → prepare")
-    run_parser.add_argument("--source", default="all")
+    run_parser = subparsers.add_parser("run", help="full pipeline: search → match → rank → prepare")
+    run_parser.add_argument("--platform", "--source", dest="platform", default="all")
+    run_parser.add_argument("--headed", action="store_true", help="show browsers while searching")
     run_parser.add_argument("--top", type=_positive_int, default=5, help="prepare top N matches")
     run_parser.add_argument(
         "--min-score",
@@ -825,8 +1121,20 @@ def _dispatch(args: argparse.Namespace) -> int:
         return cmd_db_stats()
     if args.command == "config" and args.config_command == "show":
         return cmd_config_show()
-    if args.command == "scrape":
-        return asyncio.run(_run_scrape(args.source))
+    if args.command in ("search", "scrape"):
+        return asyncio.run(_run_search(args.platform, args.headed))
+    if args.command == "platforms":
+        return asyncio.run(_run_platforms())
+    if args.command == "login":
+        return asyncio.run(_run_login(args.platform, args.timeout))
+    if args.command == "logout":
+        return asyncio.run(_run_logout(args.platform, args.yes))
+    if args.command == "status":
+        return asyncio.run(_run_status())
+    if args.command == "pause":
+        return cmd_pause(" ".join(args.reason))
+    if args.command == "unpause":
+        return cmd_unpause()
     if args.command == "resume" and args.resume_command == "import":
         return asyncio.run(_run_resume_import(args.path, args.version, not args.no_activate))
     if args.command == "resume" and args.resume_command == "list":
@@ -844,7 +1152,7 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "apply":
         return asyncio.run(_run_apply(args.application_ids))
     if args.command == "run":
-        return asyncio.run(_run_pipeline(args.source, args.top, args.min_score))
+        return asyncio.run(_run_pipeline(args.platform, args.top, args.min_score, args.headed))
     if args.command == "serve":
         import uvicorn
 
@@ -868,9 +1176,12 @@ def main(argv: list[str] | None = None) -> int:
     except PreferencesError as exc:
         console.print(f"[red]Configuration error:[/red] {exc}")
         return EXIT_CONFIG_ERROR
-    except LockBusyError as exc:
+    except (LockBusyError, ProfileInUseError) as exc:
         console.print(f"[yellow]{exc}[/yellow]")
         return EXIT_BUSY
+    except AgentPausedError as exc:
+        console.print(f"[yellow]{exc}[/yellow]")
+        return EXIT_PAUSED
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow] Progress so far is saved.")
         return 130

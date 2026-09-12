@@ -25,7 +25,7 @@ from jobpilot.domain.models import ScrapeRun
 from jobpilot.llm.provider import LLMProvider
 from jobpilot.matcher import MatchEngine, MatchingAbortedError, MatchService
 from jobpilot.matcher.ranking import RankedJob
-from jobpilot.scrapers import ScrapeRunner
+from jobpilot.platforms import SearchRunner
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +53,13 @@ class PipelineService:
         *,
         llm: LLMProvider | None,
         model_name: str = "",
+        search: SearchRunner | None = None,
     ) -> None:
         self._factory = session_factory
         self._prefs = preferences
         self._llm = llm
         self._model_name = model_name
+        self._search = search or SearchRunner(session_factory, preferences)
 
     async def run(
         self,
@@ -70,9 +72,9 @@ class PipelineService:
         """Run every stage. Caller must hold the pipeline lock."""
         report = PipelineReport()
 
-        runner = ScrapeRunner(self._factory, self._prefs)
         for source in sources:
-            report.scrape_runs.append(await runner.run(source))  # never raises per source
+            # Never raises: a platform that fails/logs out is recorded and skipped.
+            report.scrape_runs.append(await self._search.run(source))
 
         if self._llm is None:
             report.stopped_early = "LLM unavailable — skipped match, rank, and prepare"

@@ -12,8 +12,9 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
 from jobpilot.api.deps import AppState, StateDep
+from jobpilot.control import is_paused
 from jobpilot.locks import PIPELINE_LOCK, LockBusyError, process_lock
-from jobpilot.scrapers import ScrapeRunner, all_scrapers
+from jobpilot.platforms import BrowserProfiles, SearchRunner, enabled_platforms
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,8 @@ class ActionAccepted(BaseModel):
 
 
 def _ensure_pipeline_idle(state: AppState) -> None:
+    if is_paused(state.settings.data_dir):
+        raise HTTPException(409, "JobPilot is paused. Run `jobpilot unpause` first.")
     try:
         with process_lock(PIPELINE_LOCK, state.settings.locks_dir):
             pass
@@ -36,9 +39,18 @@ def _ensure_pipeline_idle(state: AppState) -> None:
 async def _scrape_all(state: AppState) -> None:
     try:
         with process_lock(PIPELINE_LOCK, state.settings.locks_dir):
-            runner = ScrapeRunner(state.session_factory, state.preferences())
-            for source in all_scrapers():
-                await runner.run(source)  # records failures itself; never raises per source
+            prefs = state.preferences()
+            settings = state.settings
+            runner = SearchRunner(
+                state.session_factory,
+                prefs,
+                profiles=BrowserProfiles(
+                    settings.profiles_dir, settings.locks_dir, channel=settings.browser_channel
+                ),
+                paused=lambda: is_paused(settings.data_dir),
+            )
+            for platform in enabled_platforms(prefs):
+                await runner.run(platform)  # records failures itself; never raises per platform
     except LockBusyError as exc:
         logger.warning("Scrape skipped: %s", exc)
     except Exception:  # noqa: BLE001 - background task: log, don't crash the server
@@ -70,9 +82,9 @@ async def _match_all(state: AppState) -> None:
 @router.post("/scrape", response_model=ActionAccepted)
 async def trigger_scrape(background: BackgroundTasks, state: StateDep) -> ActionAccepted:
     _ensure_pipeline_idle(state)
-    sources = ", ".join(s.value for s in all_scrapers())
+    platforms = ", ".join(p.value for p in enabled_platforms(state.preferences()))
     background.add_task(_scrape_all, state)
-    return ActionAccepted(detail=f"Scraping: {sources}")
+    return ActionAccepted(detail=f"Searching: {platforms or 'no platforms enabled'}")
 
 
 @router.post("/match", response_model=ActionAccepted)
