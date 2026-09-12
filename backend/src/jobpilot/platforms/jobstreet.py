@@ -23,6 +23,7 @@ from playwright.async_api import BrowserContext, Page
 from jobpilot.domain.enums import EmploymentType, JobSource, RemoteType, SessionStatus
 from jobpilot.domain.models import Job
 from jobpilot.platforms.base import (
+    ChallengeError,
     PlatformAdapter,
     PlatformError,
     SearchQuery,
@@ -207,18 +208,37 @@ class JobStreetAdapter(PlatformAdapter):
         value = await page.evaluate(TEXT_OF_JS, {"selectors": selectors, "root": root})
         return clean(value if isinstance(value, str) else "")
 
+    _SIGNED_OUT_JS = """
+    () => {
+      const markers = document.querySelectorAll(
+        '[data-automation="sign-in-register"], [data-automation="sign in"], ' +
+        '[data-automation="register for free"]'
+      );
+      for (const el of markers) {
+        if ((el.innerText || '').trim() || el.getAttribute('href')) return true;
+      }
+      const auth = document.querySelector(
+        '[data-automation="desktop-auth-links-wrapper"], ' +
+        '[data-automation="mobile-auth-links-wrapper"]'
+      );
+      return auth ? /sign ?in|register/i.test(auth.innerText || '') : false;
+    }
+    """
+
     async def session_status(self, browser: BrowserContext) -> SessionStatus:
+        """Logged out still renders the profile shell, so look for the header's
+        sign-in / register links instead of assuming a redirect."""
         page = await browser.new_page()
         try:
             await self.goto(page, f"{self.base}/profile/me")
             if any(p in page.url.lower() for p in self.logged_out_url_patterns):
                 return SessionStatus.NEEDS_LOGIN
-            signed_out = await self._text(
-                page, ['[data-automation="sign-in-register"]', '[data-automation="sign in"]']
-            )
+            signed_out = await page.evaluate(self._SIGNED_OUT_JS)
             return SessionStatus.NEEDS_LOGIN if signed_out else SessionStatus.LOGGED_IN
         except SessionExpiredError:
             return SessionStatus.NEEDS_LOGIN
+        except ChallengeError:
+            return SessionStatus.BLOCKED
         finally:
             await page.close()
 

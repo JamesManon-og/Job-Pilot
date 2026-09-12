@@ -130,14 +130,21 @@ class TestJobStreet:
         assert await form_page.locator("#rn").count() == 1
 
     async def test_session_detection(self, context: BrowserContext) -> None:
+        """Logged out, JobStreet still renders the profile page (no redirect), so
+        the check keys on the header's sign-in/register links. Assuming
+        "no redirect means logged in" reported a session that didn't exist."""
         adapter = self.adapter()
-        logged_out = Site({"/profile/me": "jobstreet_search"})  # page shows a sign-in link
-        await context.route("https://ph.jobstreet.com/**", logged_out.handle)
+        await context.route(
+            "https://ph.jobstreet.com/**",
+            Site({"/profile/me": "jobstreet_profile_signed_out"}).handle,
+        )
         assert await adapter.session_status(context) is SessionStatus.NEEDS_LOGIN
 
-        logged_in = Site({"/profile/me": "jobstreet_job"})  # no sign-in link
         await context.unroute("https://ph.jobstreet.com/**")
-        await context.route("https://ph.jobstreet.com/**", logged_in.handle)
+        await context.route(
+            "https://ph.jobstreet.com/**",
+            Site({"/profile/me": "jobstreet_profile_signed_in"}).handle,
+        )
         assert await adapter.session_status(context) is SessionStatus.LOGGED_IN
 
     async def test_other_country_domain(self) -> None:
@@ -206,6 +213,29 @@ class TestOnlineJobs:
         page = await context.new_page()
         form_page = await self.adapter().open_application(page, job)
         assert await form_page.locator("#msg").is_visible()
+
+    async def test_session_detection(self, context: BrowserContext) -> None:
+        """Logged out, the dashboard redirects to /error — not to the login page —
+        which used to read as "logged in"."""
+        adapter = self.adapter()
+
+        async def to_error(route: Route) -> None:
+            if "/jobseekers/dashboard" in route.request.url:
+                await route.fulfill(
+                    status=302, headers={"Location": "https://www.onlinejobs.ph/error"}
+                )
+            else:
+                await route.fulfill(body=page_source("onlinejobs_error"), content_type="text/html")
+
+        await context.route("https://www.onlinejobs.ph/**", to_error)
+        assert await adapter.session_status(context) is SessionStatus.NEEDS_LOGIN
+
+        await context.unroute("https://www.onlinejobs.ph/**")
+        await context.route(
+            "https://www.onlinejobs.ph/**",
+            Site({"/jobseekers/dashboard": "onlinejobs_dashboard"}).handle,
+        )
+        assert await adapter.session_status(context) is SessionStatus.LOGGED_IN
 
     def test_external_id_from_slug(self) -> None:
         assert external_id("/jobseekers/job/full-stack-1717193") == "1717193"

@@ -19,6 +19,7 @@ from playwright.async_api import BrowserContext, Page
 from jobpilot.domain.enums import EmploymentType, JobSource, RemoteType, SessionStatus
 from jobpilot.domain.models import Job
 from jobpilot.platforms.base import (
+    ChallengeError,
     PlatformAdapter,
     PlatformError,
     SearchQuery,
@@ -197,14 +198,22 @@ class OnlineJobsAdapter(PlatformAdapter):
         return clean(value if isinstance(value, str) else "")
 
     async def session_status(self, browser: BrowserContext) -> SessionStatus:
+        """A logged-out dashboard lands on /error (not the login page), so the
+        signal is a logout link, not the absence of a redirect."""
         page = await browser.new_page()
         try:
             await self.goto(page, f"{BASE}/jobseekers/dashboard")
-            if any(p in page.url.lower() for p in self.logged_out_url_patterns):
+            url = page.url.lower()
+            if "/error" in url or any(p in url for p in self.logged_out_url_patterns):
                 return SessionStatus.NEEDS_LOGIN
-            return SessionStatus.LOGGED_IN
+            logged_in = await page.evaluate(
+                "() => !!document.querySelector('a[href*=\"logout\" i]')"
+            )
+            return SessionStatus.LOGGED_IN if logged_in else SessionStatus.NEEDS_LOGIN
         except SessionExpiredError:
             return SessionStatus.NEEDS_LOGIN
+        except ChallengeError:
+            return SessionStatus.BLOCKED
         finally:
             await page.close()
 
