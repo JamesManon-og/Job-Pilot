@@ -13,6 +13,8 @@ import {
   timeAgo,
 } from "@/components/ui";
 
+const PIPELINE = ["discovered", "matched", "prepared", "applied", "rejected", "skipped"];
+
 export default function OverviewPage() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [runs, setRuns] = useState<ScrapeRun[]>([]);
@@ -67,7 +69,7 @@ export default function OverviewPage() {
         <PageTitle title="Overview" subtitle="Your local job pipeline at a glance." />
         <div className="flex gap-2">
           <Button onClick={() => act(api.triggerScrape)} disabled={busy}>
-            Scrape now
+            Search now
           </Button>
           <Button variant="ghost" onClick={() => act(api.triggerMatch)} disabled={busy}>
             Match now
@@ -75,6 +77,12 @@ export default function OverviewPage() {
         </div>
       </div>
 
+      {stats?.paused ? (
+        <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-300">
+          JobPilot is paused — searches stop and nothing new starts. Run{" "}
+          <code>jobpilot unpause</code> to continue.
+        </div>
+      ) : null}
       {error ? <ErrorNote error={error} /> : null}
       {actionError ? <ErrorNote error={actionError} /> : null}
       {actionNote ? <p className="mb-4 text-sm text-emerald-400">✓ {actionNote}</p> : null}
@@ -95,16 +103,34 @@ export default function OverviewPage() {
           </div>
 
           <h2 className="mb-3 mt-10 text-sm font-semibold uppercase tracking-wide text-zinc-500">
-            Recent scrape runs
+            Pipeline
+          </h2>
+          <div className="grid grid-cols-3 gap-4 md:grid-cols-6">
+            {PIPELINE.map((status) => (
+              <StatCard
+                key={status}
+                label={status}
+                value={stats.jobs_by_status?.[status] ?? 0}
+              />
+            ))}
+          </div>
+
+          <p className="mt-4 text-sm text-zinc-500">
+            Today: {stats.applications_today}/{stats.daily_cap} applications submitted or open
+            for submission.
+          </p>
+
+          <h2 className="mb-3 mt-10 text-sm font-semibold uppercase tracking-wide text-zinc-500">
+            Recent searches
           </h2>
           <Card className="p-0">
             {runs.length === 0 ? (
-              <Loading label="No scrape runs yet — hit “Scrape now”." />
+              <Loading label="No searches yet — hit “Search now”." />
             ) : (
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b border-zinc-800 text-left text-xs uppercase tracking-wide text-zinc-500">
-                    <th className="px-4 py-2">Source</th>
+                    <th className="px-4 py-2">Platform</th>
                     <th className="px-4 py-2">Status</th>
                     <th className="px-4 py-2 text-right">Found</th>
                     <th className="px-4 py-2 text-right">New</th>

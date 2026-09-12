@@ -12,7 +12,16 @@ from fastapi.responses import JSONResponse
 
 import jobpilot
 from jobpilot.api.deps import AppState
-from jobpilot.api.routers import actions, applications, jobs, matches, review, scrape_runs, stats
+from jobpilot.api.routers import (
+    actions,
+    applications,
+    jobs,
+    matches,
+    platforms,
+    review,
+    scrape_runs,
+    stats,
+)
 from jobpilot.config import PreferencesError
 
 ALLOWED_ORIGINS = ("http://localhost:3000", "http://127.0.0.1:3000")
@@ -86,4 +95,5 @@ def create_app() -> FastAPI:
     app.include_router(scrape_runs.router)
     app.include_router(actions.router)
     app.include_router(review.router)
+    app.include_router(platforms.router)
     return app

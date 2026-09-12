@@ -12,7 +12,7 @@ every application, and you click submit yourself** — JobPilot never submits.
 
 | Part | What it is |
 |---|---|
-| **Scraper** | Pulls jobs from RemoteOK (more boards can be added as plugins) |
+| **Platforms** | Searches RemoteOK, JobStreet, OnlineJobs.ph and LinkedIn — you log in once per board, JobPilot reuses the session |
 | **Resume parser** | Reads your PDF resume and extracts skills, tech, experience |
 | **Matcher** | Local LLM scores each job 0–100 against your resume, then ranks them |
 | **Application service** | Generates cover letters + answers, enforces daily cap and duplicate blocking |
@@ -39,14 +39,20 @@ ollama pull qwen3:8b
 .venv/bin/python -m jobpilot resume import ~/Documents/resume.pdf
 
 # Your info for autofill (config.yaml is gitignored)
-cp ../config/config.example.yaml ../config/config.yaml   # fill in `applicant:`
+cp ../config/config.example.yaml ../config/config.yaml   # fill in `applicant:` and `search:`
+
+# Log in to the boards you use (a browser opens; JobPilot never sees your password)
+.venv/bin/python -m jobpilot login jobstreet
+.venv/bin/python -m jobpilot login onlinejobs
+.venv/bin/python -m jobpilot login linkedin
+# then set platforms.<name>.enabled: true in config/config.yaml
 ```
 
 ## Daily use
 
 ```bash
 cd backend
-.venv/bin/python -m jobpilot run          # scrape → score → rank → prepare top 5
+.venv/bin/python -m jobpilot run          # search all boards → score → rank → prepare top 5
 .venv/bin/python -m jobpilot review       # approve / reject / edit in the terminal
 .venv/bin/python -m jobpilot apply        # open approved ones in a browser, autofilled
 .venv/bin/python -m jobpilot serve        # optional: the dashboard API (localhost:8000)
@@ -69,6 +75,9 @@ press `s` and confirm. That's the only way an application becomes "submitted".
 ## Useful commands
 
 ```bash
+jobpilot platforms        # which boards are on, and am I still logged in?
+jobpilot status           # where is everything in the pipeline?
+jobpilot pause            # stop the agent now (jobpilot unpause to continue)
 jobpilot llm check        # is Ollama working?
 jobpilot db stats         # how much data do I have?
 jobpilot rank --top 20    # show my best matches
@@ -80,6 +89,8 @@ jobpilot config show      # see all current settings
 
 ## Key settings (`config/config.yaml`)
 
+- `search.queries` — what to search for on every board (e.g. "react developer")
+- `platforms.<name>.enabled` — which boards to use; `min_delay_seconds` sets the pace
 - `min_match_score: 75` — `run` only prepares jobs scoring at least this
 - `max_applications_per_day: 10` — hard cap, always enforced
 - `blacklist_companies: [...]` — never apply to these
@@ -104,3 +115,7 @@ jobpilot config show      # see all current settings
   birth date, gender, salary history…), and never ticks consent boxes.
 - Daily application cap is always enforced, counted against your local day.
 - No CAPTCHA/MFA bypass, no bot-detection evasion — JobPilot stops and tells you.
+- Passwords are never seen or stored: you log in yourself, and only the browser
+  session is saved (owner-only, on your machine).
+- The same job found on two boards is applied to once.
+- LinkedIn's terms restrict automation; enabling it is your call (see README).

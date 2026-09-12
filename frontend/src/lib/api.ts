@@ -4,6 +4,10 @@ export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:800
 
 export interface Job {
   id: number;
+  status: string;
+  status_reason: string;
+  duplicate_of_id: number | null;
+  external_id: string | null;
   title: string;
   company: string;
   location: string | null;
@@ -73,9 +77,25 @@ export interface Stats {
   total_matched: number;
   strong_matches: number;
   applications_by_status: Record<string, number>;
+  jobs_by_status: Record<string, number>;
+  applications_today: number;
+  daily_cap: number;
+  paused: boolean;
   resumes: number;
   last_scrape: string | null;
   scrape_failures_recent: number;
+}
+
+export interface PlatformInfo {
+  platform: string;
+  display_name: string;
+  enabled: boolean;
+  needs_account: boolean;
+  has_saved_login: boolean;
+  session_status: string;
+  session_detail: string;
+  last_checked_at: string | null;
+  login_command: string | null;
 }
 
 export class ApiError extends Error {
@@ -130,10 +150,12 @@ export interface ReviewItem {
 
 export const api = {
   stats: () => request<Stats>("/api/stats"),
-  jobs: (params: { search?: string; source?: string; limit?: number } = {}) => {
+  platforms: () => request<PlatformInfo[]>("/api/platforms"),
+  jobs: (params: { search?: string; source?: string; status?: string; limit?: number } = {}) => {
     const query = new URLSearchParams();
     if (params.search) query.set("search", params.search);
     if (params.source) query.set("source", params.source);
+    if (params.status) query.set("status", params.status);
     query.set("limit", String(params.limit ?? 50));
     return request<Job[]>(`/api/jobs?${query}`);
   },

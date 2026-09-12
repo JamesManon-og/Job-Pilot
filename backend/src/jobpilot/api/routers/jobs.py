@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException
 
 from jobpilot.api.deps import SessionDep
 from jobpilot.database.repositories import JobRepository
-from jobpilot.domain.enums import JobSource, RemoteType
+from jobpilot.domain.enums import JobSource, JobStatus, RemoteType
 from jobpilot.domain.models import Job
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
@@ -17,12 +17,18 @@ async def list_jobs(
     session: SessionDep,
     source: JobSource | None = None,
     remote: RemoteType | None = None,
+    status: JobStatus | None = None,
     search: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> list[Job]:
     return await JobRepository(session).list(
-        source=source, remote=remote, search=search, limit=min(limit, 200), offset=offset
+        source=source,
+        remote=remote,
+        status=status,
+        search=search,
+        limit=min(limit, 200),
+        offset=offset,
     )
 
 

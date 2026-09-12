@@ -1,25 +1,20 @@
-# JobPilot — Local AI Job Application Automation
+# JobPilot — Local AI Job Application Agent
 
-A fully local system that scrapes jobs, scores them against your resume with a local LLM
-(Ollama), generates application materials, autofills forms via Playwright, and logs
-everything — with a Next.js dashboard. Nothing leaves your machine.
+A fully local agent that searches the job boards you actually use, scores every posting
+against your resume with a local LLM (Ollama), writes the materials, opens each approved
+application in a real browser and fills it in — then stops, because **you** click submit.
+Nothing leaves your machine except the job-board traffic itself.
+
+Platforms: **RemoteOK** (no account), **JobStreet**, **OnlineJobs.ph**, **LinkedIn**
+(your own logged-in browser session — see the note in `platforms/linkedin.py`).
 
 ## Status
 
-| Milestone | Description | Status |
-|---|---|---|
-| M1 | Project architecture & scaffold | done |
-| M2 | Database layer (SQLAlchemy + Alembic + repositories) | done |
-| M3 | Scraper framework (rate limiter, normalizer, runner) | done |
-| M4 | RemoteOK scraper | done |
-| M5 | PDF resume parser | done |
-| M6 | Ollama LLM integration | done |
-| M7 | Matching engine (LLM scoring + weighted ranking) | done |
-| M8 | FastAPI + Next.js dashboard | done |
-| M9 | Playwright autofill | done |
-| M10 | Application service & orchestration | done |
-| M11 | Human-approval workflow | done |
-| M12 | Production hardening, pipeline, Dockerfile | done |
+| Part | State |
+|---|---|
+| M1–M12 (scaffold → pipeline, dashboard, autofill, approval) | done |
+| Reliability audit (see `git log`) | done |
+| Platform adapters: RemoteOK, JobStreet, OnlineJobs.ph, LinkedIn | done |
 
 ## Quick Start
 
@@ -42,19 +37,25 @@ cp ../config/config.example.yaml ../config/config.yaml   # then fill in `applica
 # 4. Import your resume
 .venv/bin/python -m jobpilot resume import ~/path/to/resume.pdf
 
-# 5. Find, score, and prepare applications
+# 5. Log in to the boards you want (a browser opens; you type, JobPilot never sees it)
+.venv/bin/python -m jobpilot login jobstreet
+.venv/bin/python -m jobpilot login onlinejobs
+.venv/bin/python -m jobpilot login linkedin
+#    …then enable them under `platforms:` in config/config.yaml
+
+# 6. Find, score, and prepare applications
 .venv/bin/python -m jobpilot run
 
-# 6. Review, then open approved ones in a browser and submit them yourself
+# 7. Review, then open approved ones in a browser and submit them yourself
 .venv/bin/python -m jobpilot review
 .venv/bin/python -m jobpilot apply
 
-# 7. Frontend (requires Node 20+)
+# 8. Frontend (requires Node 20+)
 cd ../frontend
 npm ci
 npm run dev        # http://localhost:3000
 
-# 8. Dashboard API
+# 9. Dashboard API
 cd ../backend
 .venv/bin/python -m jobpilot serve   # http://localhost:8000
 ```
@@ -65,7 +66,12 @@ cd ../backend
 jobpilot db init                    Create/upgrade the database (Alembic)
 jobpilot db stats                   Print row counts per table
 jobpilot config show                Print resolved settings + preferences
-jobpilot scrape [--source remoteok] Scrape job boards (default: all)
+jobpilot platforms                  List boards, login state, and settings
+jobpilot login <platform>           Log in yourself in a browser; the session is saved
+jobpilot logout <platform>          Delete a saved login
+jobpilot search [--platform x]      Search enabled boards (alias: scrape) [--headed]
+jobpilot status                     Pipeline counts, today's cap, platform sessions
+jobpilot pause [reason] / unpause   Stop / resume the agent
 jobpilot resume import <path>       Parse and store a resume PDF
 jobpilot resume list                List stored resume versions
 jobpilot llm check                  Verify Ollama server, model, generation
@@ -78,14 +84,17 @@ jobpilot run [--top 5]              Full pipeline: scrape → match → rank →
 jobpilot serve [--port 8000]        Start the dashboard API server
 ```
 
-`scrape`, `match`, `prepare`, and `run` share a cross-process lock: a second
+`search`, `match`, `prepare`, and `run` share a cross-process lock: a second
 one exits with code 3 instead of racing the first. Configuration errors exit
-with code 2 and name the offending field.
+with code 2 and name the offending field; a paused agent exits with code 4.
 
 ## Pipeline (`jobpilot run`)
 
-1. **Scrape** — pulls new jobs from every configured source; a failing source
-   is recorded and the others still run
+1. **Search** — runs your `search.queries` on every enabled platform. Postings
+   already in the database are recognized from the results page and never
+   re-fetched; the same job found on another board is linked as a duplicate and
+   never scored twice. A platform that fails, logs out, or hits a bot check is
+   recorded and skipped — the others still run
 2. **Match** — scores unscored jobs with the local LLM; one bad reply is
    skipped and retried next run, and progress survives interruption
 3. **Rank** — composite score (LLM score + salary + remote + recency + tech
@@ -135,6 +144,23 @@ gitignored because it holds your personal details). See the example file for
 every key. Relative `resume_file` paths resolve against the project root; if
 it's blank, the active imported resume is uploaded.
 
+## Platforms and logins
+
+```
+jobpilot login linkedin      # opens a browser; you log in; the session is saved
+jobpilot platforms           # who's enabled, who's logged in, what needs attention
+```
+
+- One persistent Chromium profile per platform under `data/browser-profiles/`
+  (owner-only permissions, gitignored). **JobPilot never sees, types, or stores
+  your password**, and never creates accounts.
+- Sessions are checked before each run. Expired ones mark the platform
+  `needs_login` and skip it; CAPTCHAs, MFA, and bot checks mark it `blocked`.
+  JobPilot never attempts to solve or bypass any of them — during `apply` the
+  window stays open so you can handle it and press `f` to continue.
+- Adding a board is one file: subclass `PlatformAdapter` (search, enrich,
+  session_status, open_application) and `@register_platform`.
+
 ## Architecture
 
 Clean Architecture — the domain layer is pure (no infrastructure imports), everything
@@ -146,7 +172,10 @@ backend/src/jobpilot/
 ├── domain/          Pure entities & enums (Job, Application, MatchResult, …)
 ├── database/        Async SQLAlchemy engine, ORM, Alembic migrations
 │   └── repositories/  JobRepo, ResumeRepo, ApplicationRepo, ScrapeRunRepo, MatchResultRepo
-├── scrapers/        BaseScraper ABC + plugin registry + RemoteOK
+├── platforms/       PlatformAdapter ABC + registry + browser profiles + SearchRunner
+│   └── remoteok · jobstreet · onlinejobs · linkedin
+├── scrapers/        Shared HTTP plumbing (rate limit, retry) + RemoteOK API client
+├── control.py       Pause / unpause switch
 ├── llm/             LLMProvider protocol + OllamaClient
 ├── matcher/         MatchEngine (LLM scoring) + composite ranking
 ├── resume/          PDF extraction + heuristic/LLM structuring
@@ -165,7 +194,11 @@ frontend/
 
 Key design decisions:
 
-- **Plugin scrapers** — subclass `BaseScraper` + `@register_scraper`; adding a board is one file.
+- **Plugin adapters** — everything platform-specific lives in one adapter; dedup,
+  filtering, matching, autofill, and approval are shared.
+- **Two-phase discovery** — cheap listing pass, then detail pages only for new postings.
+- **Job identity** — `(platform, external_id)` or canonical URL; a normalized
+  company+title fingerprint links the same job across boards.
 - **Repository pattern** — services never touch SQLAlchemy directly.
 - **Duplicate prevention** — jobs are keyed by `dedup_hash` with an `application_url`
   fallback; `applications.job_id` UNIQUE plus a cross-source company+title check.
@@ -181,8 +214,12 @@ Key design decisions:
 
 - **Human approval is mandatory**, and only you click submit.
 - **Not included by design:** CAPTCHA solving/bypass, MFA handling, browser-fingerprint
-  rotation, proxy rotation for evasion.
-- LinkedIn/Indeed scrapers are documented as ToS-risky.
+  rotation, proxy rotation, or any other evasion.
+- **LinkedIn:** its User Agreement restricts automated access. JobPilot drives your own
+  session at human pace with small caps, but enabling it is your decision and can put
+  the account at risk.
+- **Rate limits** are per platform (`min_delay_seconds`), and daily application caps can
+  be set globally and per platform.
 
 ## Docker (Backend Only)
 

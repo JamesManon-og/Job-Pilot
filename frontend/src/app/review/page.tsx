@@ -10,16 +10,21 @@ export default function ReviewPage() {
   const { data: items, error: loadError, loading, reload } = useApi(fetchQueue);
   const [selected, setSelected] = useState<ReviewItem | null>(null);
   const [editedLetter, setEditedLetter] = useState("");
+  const [editedAnswers, setEditedAnswers] = useState<Record<string, string>>({});
   const [acting, setActing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const dirty = selected !== null && editedLetter !== selected.cover_letter;
+  const answersChanged =
+    selected !== null &&
+    JSON.stringify(editedAnswers) !== JSON.stringify(selected.answers);
+  const dirty = selected !== null && (editedLetter !== selected.cover_letter || answersChanged);
 
   function selectItem(item: ReviewItem) {
     if (dirty && !window.confirm("Discard your unsaved cover-letter edits?")) return;
     setSelected(item);
     setEditedLetter(item.cover_letter);
+    setEditedAnswers({ ...item.answers });
     setActionError(null);
   }
 
@@ -48,8 +53,11 @@ export default function ReviewPage() {
     if (!selected) return;
     const id = selected.application_id;
     void act(async () => {
-      const result = await api.editMaterials(id, { cover_letter: editedLetter });
-      setSelected({ ...selected, cover_letter: editedLetter });
+      const result = await api.editMaterials(id, {
+        cover_letter: editedLetter,
+        answers: editedAnswers,
+      });
+      setSelected({ ...selected, cover_letter: editedLetter, answers: { ...editedAnswers } });
       return result;
     }, false);
   }
@@ -134,7 +142,10 @@ export default function ReviewPage() {
                   htmlFor="cover-letter"
                   className="mb-1 block text-xs font-medium uppercase tracking-wide text-zinc-500"
                 >
-                  Cover letter {dirty ? <span className="text-amber-400">(unsaved)</span> : null}
+                  Cover letter{" "}
+                  {editedLetter !== selected.cover_letter ? (
+                    <span className="text-amber-400">(unsaved)</span>
+                  ) : null}
                 </label>
                 <textarea
                   id="cover-letter"
@@ -145,16 +156,29 @@ export default function ReviewPage() {
                 />
               </div>
 
-              {Object.keys(selected.answers).length > 0 && (
+              {Object.keys(editedAnswers).length > 0 && (
                 <div>
                   <h4 className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">
-                    Prepared answers
+                    Answers (edit before approving)
                   </h4>
                   <div className="space-y-2">
-                    {Object.entries(selected.answers).map(([q, a]) => (
-                      <div key={q} className="rounded-lg bg-zinc-800/60 p-2 text-sm">
-                        <p className="font-medium text-zinc-300">{q}</p>
-                        <p className="mt-0.5 text-zinc-400">{a}</p>
+                    {Object.entries(editedAnswers).map(([question, answer]) => (
+                      <div key={question} className="rounded-lg bg-zinc-800/60 p-2 text-sm">
+                        <label
+                          htmlFor={`answer-${question}`}
+                          className="font-medium text-zinc-300"
+                        >
+                          {question}
+                        </label>
+                        <textarea
+                          id={`answer-${question}`}
+                          value={answer}
+                          rows={3}
+                          onChange={(e) =>
+                            setEditedAnswers((prev) => ({ ...prev, [question]: e.target.value }))
+                          }
+                          className="mt-1 w-full rounded border border-zinc-700 bg-zinc-900 p-2 text-sm text-zinc-300 focus:border-zinc-500 focus:outline-none"
+                        />
                       </div>
                     ))}
                   </div>
