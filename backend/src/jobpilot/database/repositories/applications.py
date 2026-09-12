@@ -57,12 +57,15 @@ class InvalidTransitionError(Exception):
 
 
 class DailyCapReachedError(Exception):
-    def __init__(self, cap: int, used_today: int) -> None:
+    def __init__(self, cap: int, used_today: int, *, platform: str | None = None) -> None:
+        scope = f"{platform} " if platform else ""
         super().__init__(
-            f"Daily cap reached: {used_today}/{cap} applications submitted or in progress today"
+            f"Daily {scope}cap reached: {used_today}/{cap} {scope}applications submitted or "
+            "in progress today"
         )
         self.cap = cap
         self.used_today = used_today
+        self.platform = platform
 
 
 def _to_domain(row: ApplicationRow) -> Application:
@@ -235,12 +238,19 @@ class ApplicationRepository:
             return None
 
     async def claim_for_autofill(
-        self, application_id: int, *, daily_cap: int, day_start: datetime
+        self,
+        application_id: int,
+        *,
+        daily_cap: int,
+        day_start: datetime,
+        platform_caps: dict[str, int] | None = None,
     ) -> Application:
-        """APPROVED/FAILED -> AWAITING_CONFIRMATION, only if under the daily cap.
+        """APPROVED/FAILED -> AWAITING_CONFIRMATION, only while under the daily caps.
 
-        The cap check and the status change are one UPDATE statement, so two
-        `jobpilot apply` processes can't both squeeze past the cap.
+        The cap checks and the status change are one UPDATE statement, so two
+        `jobpilot apply` processes can't both squeeze past a cap. `platform_caps`
+        adds per-platform limits (jobs.source -> max per day) on top of the
+        global one.
         """
         current = await self._current_status(application_id)
         target = ApplicationStatus.AWAITING_CONFIRMATION
@@ -251,19 +261,22 @@ class ApplicationRepository:
         if not can_transition(current, target):
             raise InvalidTransitionError(application_id, current, target)
 
-        used_today = (
-            select(func.count())
-            .select_from(ApplicationRow)
-            .where(_counts_toward_cap(day_start))
-            .scalar_subquery()
+        conditions = [
+            ApplicationRow.id == application_id,
+            ApplicationRow.status == current.value,
+            self._used_today(day_start) < daily_cap,
+        ]
+        source = await self._session.scalar(
+            select(JobRow.source)
+            .join(ApplicationRow, ApplicationRow.job_id == JobRow.id)
+            .where(ApplicationRow.id == application_id)
         )
+        platform_cap = (platform_caps or {}).get(source or "")
+        if platform_cap is not None:
+            conditions.append(self._used_today(day_start, source=source) < platform_cap)
         result = await self._session.execute(
             update(ApplicationRow)
-            .where(
-                ApplicationRow.id == application_id,
-                ApplicationRow.status == current.value,
-                used_today < daily_cap,
-            )
+            .where(*conditions)
             .values(status=target.value)
             .execution_options(synchronize_session="fetch")
         )
@@ -271,13 +284,28 @@ class ApplicationRepository:
             now_status = await self._current_status(application_id)
             if now_status is not current:
                 raise InvalidTransitionError(application_id, now_status, target)
-            raise DailyCapReachedError(daily_cap, await self.count_toward_cap(day_start))
+            used = await self.count_toward_cap(day_start)
+            if used < daily_cap and platform_cap is not None:
+                raise DailyCapReachedError(
+                    platform_cap,
+                    await self.count_toward_cap(day_start, source=source),
+                    platform=source,
+                )
+            raise DailyCapReachedError(daily_cap, used)
         await self.log_event(
             application_id, "status_changed", {"from": current.value, "to": target.value}
         )
         claimed = await self.get(application_id)
         assert claimed is not None
         return claimed
+
+    def _used_today(self, day_start: datetime, *, source: str | None = None) -> Any:
+        stmt = select(func.count()).select_from(ApplicationRow).where(_counts_toward_cap(day_start))
+        if source is not None:
+            stmt = stmt.join(JobRow, JobRow.id == ApplicationRow.job_id).where(
+                JobRow.source == source
+            )
+        return stmt.scalar_subquery()
 
     async def update_materials(
         self,
@@ -331,11 +359,14 @@ class ApplicationRepository:
         )
         return result or 0
 
-    async def count_toward_cap(self, since: datetime) -> int:
+    async def count_toward_cap(self, since: datetime, *, source: str | None = None) -> int:
         """Submitted since `since` plus those currently open for submission."""
-        result = await self._session.scalar(
-            select(func.count()).select_from(ApplicationRow).where(_counts_toward_cap(since))
-        )
+        stmt = select(func.count()).select_from(ApplicationRow).where(_counts_toward_cap(since))
+        if source is not None:
+            stmt = stmt.join(JobRow, JobRow.id == ApplicationRow.job_id).where(
+                JobRow.source == source
+            )
+        result = await self._session.scalar(stmt)
         return result or 0
 
     async def job_ids_with_applications(self) -> set[int]:

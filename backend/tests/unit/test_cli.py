@@ -69,7 +69,7 @@ def test_prompt_key_hints_are_visible(monkeypatch: pytest.MonkeyPatch) -> None:
 
     from rich.console import Console
 
-    from jobpilot.applications.runner import Decision
+    from jobpilot.applications.runner import Decision, FillState
     from jobpilot.domain import Application, Job, JobSource
 
     recorded = Console(record=True, width=200)
@@ -79,12 +79,18 @@ def test_prompt_key_hints_are_visible(monkeypatch: pytest.MonkeyPatch) -> None:
         recorded, "input", lambda prompt="": recorded.print(prompt, end="") or next(answers)
     )
     job = Job(title="T", company="C", application_url="https://x.test", source=JobSource.OTHER)
-    decision = asyncio.run(
-        cli._ask_decision(Application(id=1, job_id=1, resume_id=1), job, None, None)
-    )
+    state = FillState(result=None, error=None, can_propose=True)
+    decision = asyncio.run(cli._ask_decision(Application(id=1, job_id=1, resume_id=1), job, state))
     assert decision is Decision.KEEP
     text = recorded.export_text()
-    for hint in ("[s] I submitted it", "[f] fill", "[k] keep", "[r] reject", "[q] quit"):
+    for hint in (
+        "[s] I submitted it",
+        "[f] fill",
+        "[k] keep",
+        "[p] draft answers",
+        "[r] reject",
+        "[q] quit",
+    ):
         assert hint in text
 
 
