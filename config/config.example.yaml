@@ -6,12 +6,41 @@ min_match_score: 75            # `jobpilot run` only prepares jobs whose LLM sco
 preferred_technologies: []     # e.g. [react, nextjs, typescript, tailwind, nodejs, postgresql]
 preferred_countries: []        # e.g. [Philippines, United States]; empty = anywhere
 preferred_salary_min: null     # annual USD; null = no minimum
-preferred_job_titles: []       # e.g. [frontend developer, full stack developer]
-remote_only: true
-blacklist_companies: []        # never scrape, prepare, or apply to these
+preferred_job_titles: []       # used as search terms when `search.queries` is empty
+remote_only: true              # skips onsite jobs; also filters searches to remote where supported
+blacklist_companies: []        # never searched, prepared, or applied to
+excluded_keywords: []          # skip postings whose title/description contains any of these
+employment_types: []           # e.g. [full_time, contract]; empty = any
 max_applications_per_day: 10   # hard cap on submissions (and forms open for submission) per local day
 resume_version: default
 cover_letter_template: default
+
+# What to search for on every enabled platform.
+search:
+  queries: []                  # e.g. ["react developer", "full stack developer"]
+  location: ""                 # e.g. "Philippines"; empty = the platform's default
+  max_results_per_query: 25
+  posted_within_days: 14
+
+# Job boards. Log in once with `jobpilot login <platform>`, then enable it here.
+# RemoteOK needs no account. JobStreet and OnlineJobs.ph can search without one
+# but need your login to apply; LinkedIn needs it for both.
+platforms:
+  remoteok:
+    enabled: true
+    min_delay_seconds: 2.0
+  jobstreet:
+    enabled: false
+    min_delay_seconds: 3.0
+    # options: {domain: "www.jobstreet.com.sg"}   # default: ph.jobstreet.com
+  onlinejobs:
+    enabled: false
+    min_delay_seconds: 3.0
+  linkedin:
+    enabled: false             # LinkedIn's terms restrict automation — your call
+    min_delay_seconds: 5.0
+    max_results_per_query: 25
+    max_applications_per_day: 5
 
 # Human approval is mandatory and only you click submit. The old
 # auto_submit_enabled / human_approval_enabled switches are ignored.

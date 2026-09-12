@@ -6,9 +6,15 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
-from jobpilot.api.deps import SessionDep
+from jobpilot.api.deps import SessionDep, StateDep
+from jobpilot.applications import local_day_start
+from jobpilot.control import is_paused
 from jobpilot.database.orm import ApplicationRow, JobRow, ResumeRow, ScrapeRunRow
-from jobpilot.database.repositories import MatchResultRepository
+from jobpilot.database.repositories import (
+    ApplicationRepository,
+    JobRepository,
+    MatchResultRepository,
+)
 
 router = APIRouter(prefix="/api/stats", tags=["stats"])
 
@@ -18,13 +24,17 @@ class Stats(BaseModel):
     total_matched: int
     strong_matches: int
     applications_by_status: dict[str, int]
+    jobs_by_status: dict[str, int]
+    applications_today: int
+    daily_cap: int
+    paused: bool
     resumes: int
     last_scrape: str | None
     scrape_failures_recent: int
 
 
 @router.get("", response_model=Stats)
-async def get_stats(session: SessionDep) -> Stats:
+async def get_stats(session: SessionDep, state: StateDep) -> Stats:
     total_jobs = (await session.scalar(select(func.count()).select_from(JobRow))) or 0
     # Matches are per resume; counting every resume's rows double-counts jobs.
     active_resume_id = await session.scalar(
@@ -56,7 +66,12 @@ async def get_stats(session: SessionDep) -> Stats:
         )
     ) or 0
 
+    preferences = state.preferences()
     return Stats(
+        jobs_by_status=await JobRepository(session).count_by_status(),
+        applications_today=await ApplicationRepository(session).count_toward_cap(local_day_start()),
+        daily_cap=preferences.max_applications_per_day,
+        paused=is_paused(state.settings.data_dir),
         total_jobs=total_jobs,
         total_matched=total_matched,
         strong_matches=strong_matches,

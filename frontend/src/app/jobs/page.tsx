@@ -3,7 +3,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, Job } from "@/lib/api";
 import { useApi } from "@/lib/useApi";
-import { Card, ErrorNote, Loading, PageTitle, timeAgo } from "@/components/ui";
+import { Card, ErrorNote, Loading, PageTitle, StatusBadge, timeAgo } from "@/components/ui";
+
+const STATUSES = ["all", "discovered", "matched", "prepared", "applied", "skipped"] as const;
 
 export default function JobsPage() {
   const [search, setSearch] = useState("");
@@ -12,7 +14,16 @@ export default function JobsPage() {
     const timer = setTimeout(() => setQuery(search.trim()), 250);
     return () => clearTimeout(timer);
   }, [search]);
-  const fetchJobs = useCallback(() => api.jobs({ search: query || undefined, limit: 100 }), [query]);
+  const [status, setStatus] = useState<(typeof STATUSES)[number]>("all");
+  const fetchJobs = useCallback(
+    () =>
+      api.jobs({
+        search: query || undefined,
+        status: status === "all" ? undefined : status,
+        limit: 100,
+      }),
+    [query, status],
+  );
   const { data: jobs, error, loading } = useApi(fetchJobs);
 
   return (
@@ -27,6 +38,20 @@ export default function JobsPage() {
         className="mb-4 w-full max-w-md rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm outline-none placeholder:text-zinc-600 focus:border-zinc-600"
       />
 
+      <div className="mb-4 flex flex-wrap gap-1">
+        {STATUSES.map((option) => (
+          <button
+            key={option}
+            onClick={() => setStatus(option)}
+            className={`rounded-lg px-3 py-1.5 text-sm transition ${
+              status === option ? "bg-zinc-100 text-zinc-900" : "text-zinc-400 hover:bg-zinc-900"
+            }`}
+          >
+            {option}
+          </button>
+        ))}
+      </div>
+
       {loading ? <Loading /> : null}
       {jobs ? (
         <Card className="overflow-x-auto p-0">
@@ -35,6 +60,8 @@ export default function JobsPage() {
               <tr className="border-b border-zinc-800 text-left text-xs uppercase tracking-wide text-zinc-500">
                 <th className="px-4 py-2">Title</th>
                 <th className="px-4 py-2">Company</th>
+                <th className="px-4 py-2">Platform</th>
+                <th className="px-4 py-2">Status</th>
                 <th className="px-4 py-2">Tech</th>
                 <th className="px-4 py-2">Salary</th>
                 <th className="px-4 py-2">Posted</th>
@@ -54,6 +81,15 @@ export default function JobsPage() {
                     </a>
                   </td>
                   <td className="px-4 py-2 text-zinc-400">{job.company}</td>
+                  <td className="px-4 py-2 text-zinc-500">{job.source}</td>
+                  <td className="px-4 py-2">
+                    <StatusBadge status={job.status} />
+                    {job.status_reason ? (
+                      <p className="mt-0.5 max-w-48 truncate text-xs text-zinc-600">
+                        {job.status_reason}
+                      </p>
+                    ) : null}
+                  </td>
                   <td className="max-w-56 px-4 py-2">
                     <div className="flex flex-wrap gap-1">
                       {job.technologies.slice(0, 4).map((tech) => (
@@ -77,7 +113,7 @@ export default function JobsPage() {
               ))}
               {jobs.length === 0 ? (
                 <tr>
-                  <td colSpan={5}>
+                  <td colSpan={7}>
                     <Loading label="No jobs found." />
                   </td>
                 </tr>

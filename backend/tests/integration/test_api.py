@@ -391,3 +391,61 @@ class TestStatsAndActions:
             resp = await client.post("/api/actions/scrape")
         assert resp.status_code == 409
         assert "already in progress" in resp.json()["detail"]
+
+
+class TestPlatformsAPI:
+    async def test_lists_adapters_with_session_state(
+        self, client: httpx.AsyncClient, engine: AsyncEngine
+    ) -> None:
+        from jobpilot.database.repositories import PlatformSessionRepository
+        from jobpilot.domain import JobSource, SessionStatus
+
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            await PlatformSessionRepository(session).record(
+                JobSource.LINKEDIN, SessionStatus.NEEDS_LOGIN, detail="session expired"
+            )
+            await session.commit()
+
+        rows = {p["platform"]: p for p in (await client.get("/api/platforms")).json()}
+        assert {"remoteok", "linkedin", "jobstreet", "onlinejobs"} <= set(rows)
+        assert rows["remoteok"]["needs_account"] is False
+        assert rows["remoteok"]["session_status"] == "not_required"
+        assert rows["remoteok"]["enabled"] is True  # default
+        assert rows["linkedin"]["session_status"] == "needs_login"
+        assert rows["linkedin"]["session_detail"] == "session expired"
+        assert rows["linkedin"]["login_command"] == "jobpilot login linkedin"
+        assert rows["linkedin"]["has_saved_login"] is False
+
+    async def test_stats_include_the_pipeline_funnel_and_pause_flag(
+        self, client: httpx.AsyncClient, engine: AsyncEngine, app_state: AppState
+    ) -> None:
+        from jobpilot.control import pause
+
+        await seed_job(engine)
+        stats = (await client.get("/api/stats")).json()
+        assert stats["jobs_by_status"] == {"discovered": 1}
+        assert stats["paused"] is False
+        assert stats["daily_cap"] == 10 and stats["applications_today"] == 0
+
+        pause(app_state.settings.data_dir, "manual stop")
+        assert (await client.get("/api/stats")).json()["paused"] is True
+        assert (await client.post("/api/actions/scrape")).status_code == 409
+
+    async def test_jobs_can_be_filtered_by_pipeline_status(
+        self, client: httpx.AsyncClient, engine: AsyncEngine
+    ) -> None:
+        from jobpilot.database.repositories import JobRepository
+        from jobpilot.domain import JobStatus
+
+        job = await seed_job(engine)
+        assert job.id is not None
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            await JobRepository(session).set_status(job.id, JobStatus.SKIPPED, reason="duplicate")
+            await session.commit()
+
+        assert (await client.get("/api/jobs", params={"status": "discovered"})).json() == []
+        skipped = (await client.get("/api/jobs", params={"status": "skipped"})).json()
+        assert len(skipped) == 1
+        assert skipped[0]["status_reason"] == "duplicate"
