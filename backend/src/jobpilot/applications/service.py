@@ -22,9 +22,10 @@ from jobpilot.database.repositories import (
     DailyCapReachedError,
     DuplicateApplicationError,
     JobRepository,
+    PlatformSessionRepository,
     ResumeRepository,
 )
-from jobpilot.domain.enums import ApplicationStatus
+from jobpilot.domain.enums import ApplicationStatus, JobSource, SessionStatus
 from jobpilot.domain.models import Application, Job, ResumeProfile
 from jobpilot.llm.provider import LLMProvider
 
@@ -184,6 +185,11 @@ class ApplicationService:
                     application_id,
                     daily_cap=self._prefs.max_applications_per_day,
                     day_start=local_day_start(),
+                    platform_caps={
+                        name: settings.max_applications_per_day
+                        for name, settings in self._prefs.platforms.items()
+                        if settings.max_applications_per_day is not None
+                    },
                 )
                 job = await JobRepository(session).get(application.job_id)
                 if job is None:  # FK makes this impossible; fail loudly if it happens
@@ -220,6 +226,43 @@ class ApplicationService:
 
     async def return_to_review(self, application_id: int, *, notes: str) -> Application:
         return await self._transition(application_id, ApplicationStatus.PENDING_REVIEW, notes=notes)
+
+    async def propose_answers(self, application_id: int, proposed: dict[str, str]) -> Application:
+        """Send an open application back to review with LLM-proposed answers.
+
+        Proposed answers are never typed into a form directly: the human
+        reviews (and edits) them first, then approves again.
+        """
+        async with self._session_factory() as session:
+            repo = ApplicationRepository(session)
+            try:
+                current = await repo.get(application_id)
+                if current is None:
+                    raise ValueError(f"Application {application_id} not found")
+                await repo.transition(
+                    application_id,
+                    ApplicationStatus.PENDING_REVIEW,
+                    notes=(
+                        f"JobPilot proposed {len(proposed)} answer(s) for questions on the "
+                        "form. Review and edit them, then approve again."
+                    ),
+                    payload={"proposed_questions": sorted(proposed)},
+                )
+                updated = await repo.update_materials(
+                    application_id, answers={**current.answers, **proposed}
+                )
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+        return updated
+
+    async def record_platform_session(
+        self, platform: JobSource, status: SessionStatus, detail: str = ""
+    ) -> None:
+        async with self._session_factory() as session:
+            await PlatformSessionRepository(session).record(platform, status, detail=detail)
+            await session.commit()
 
     async def mark_failed(self, application_id: int, *, reason: str) -> Application:
         return await self._transition(application_id, ApplicationStatus.FAILED, notes=reason)

@@ -10,11 +10,11 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
-from playwright.async_api import BrowserContext, Route, async_playwright
+from playwright.async_api import BrowserContext, Page, Route, async_playwright
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from jobpilot.applications import ApplicationService
-from jobpilot.applications.runner import ApplyRunner, Decision, StaleDecision
+from jobpilot.applications.runner import ApplyRunner, Decision, FillState, StaleDecision
 from jobpilot.autofill import AutofillEngine, FilledForm
 from jobpilot.config.preferences import ApplicantProfile, UserPreferences
 from jobpilot.database import create_session_factory
@@ -77,24 +77,50 @@ def scripted(*decisions: Decision) -> tuple[list[FilledForm | None], object]:
     seen: list[FilledForm | None] = []
     queue = list(decisions)
 
-    async def ask(
-        application: Application, job: Job, result: FilledForm | None, error: str | None
-    ) -> Decision:
-        seen.append(result)
+    async def ask(application: Application, job: Job, state: FillState) -> Decision:
+        seen.append(state.result)
         return queue.pop(0)
 
     return seen, ask
 
 
+class OneContext:
+    """ContextProvider for tests: every job opens in the same context."""
+
+    def __init__(self, context: BrowserContext, adapter: object | None = None) -> None:
+        self.context = context
+        self.adapter = adapter
+
+    async def for_job(self, job: Job) -> tuple[BrowserContext, object | None]:
+        return self.context, self.adapter
+
+
 def make_runner(
-    engine: AsyncEngine, tmp_path: Path, ask: object, **prefs: object
+    engine: AsyncEngine,
+    tmp_path: Path,
+    ask: object,
+    context: BrowserContext,
+    *,
+    adapter: object | None = None,
+    proposer: object | None = None,
+    paused: object = lambda: False,
+    **prefs: object,
 ) -> tuple[ApplyRunner, ApplicationService]:
     service = ApplicationService(
         create_session_factory(engine),
         UserPreferences(applicant=APPLICANT, **prefs),  # type: ignore[arg-type]
     )
     autofill = AutofillEngine(APPLICANT, tmp_path / "shots")
-    return ApplyRunner(service, autofill, ask=ask, say=lambda _: None), service  # type: ignore[arg-type]
+    runner = ApplyRunner(
+        service,
+        autofill,
+        OneContext(context, adapter),  # type: ignore[arg-type]
+        ask=ask,  # type: ignore[arg-type]
+        say=lambda _: None,
+        proposer=proposer,  # type: ignore[arg-type]
+        paused=paused,  # type: ignore[arg-type]
+    )
+    return runner, service
 
 
 class TestApplyRunner:
@@ -104,10 +130,10 @@ class TestApplyRunner:
         site = Site()
         await context.route("https://jobs.test/**", site.handle)
         seen, ask = scripted(Decision.SUBMITTED)
-        runner, service = make_runner(engine, tmp_path, ask)
+        runner, service = make_runner(engine, tmp_path, ask, context)
         app_id = await approved_app(engine, service)
 
-        outcome = await runner.process(context, app_id)
+        outcome = await runner.process(app_id)
 
         assert outcome.status is ApplicationStatus.SUBMITTED
         assert seen[0] is not None and seen[0].fields_filled["name"] == "James Manon"
@@ -126,10 +152,10 @@ class TestApplyRunner:
     ) -> None:
         await context.route("https://jobs.test/**", Site().handle)
         seen, ask = scripted(Decision.REFILL, Decision.KEEP)
-        runner, service = make_runner(engine, tmp_path, ask)
+        runner, service = make_runner(engine, tmp_path, ask, context)
         app_id = await approved_app(engine, service)
 
-        outcome = await runner.process(context, app_id)
+        outcome = await runner.process(app_id)
         assert outcome.status is ApplicationStatus.APPROVED
         assert len(seen) == 2
         async with create_session_factory(engine)() as session:
@@ -141,10 +167,10 @@ class TestApplyRunner:
     ) -> None:
         await context.route("https://jobs.test/**", Site(status=404).handle)
         _, ask = scripted()
-        runner, service = make_runner(engine, tmp_path, ask)
+        runner, service = make_runner(engine, tmp_path, ask, context)
         app_id = await approved_app(engine, service)
 
-        outcome = await runner.process(context, app_id)
+        outcome = await runner.process(app_id)
         assert outcome.status is ApplicationStatus.FAILED
         async with create_session_factory(engine)() as session:
             app = await ApplicationRepository(session).get(app_id)
@@ -156,11 +182,11 @@ class TestApplyRunner:
         site = Site()
         await context.route("https://jobs.test/**", site.handle)
         _, ask = scripted()
-        runner, service = make_runner(engine, tmp_path, ask)
+        runner, service = make_runner(engine, tmp_path, ask, context)
         app_id = await approved_app(engine, service)
         await service.return_to_review(app_id, notes="changed my mind")
 
-        outcome = await runner.process(context, app_id)
+        outcome = await runner.process(app_id)
         assert outcome.status is ApplicationStatus.PENDING_REVIEW
         assert site.requests == []
 
@@ -170,12 +196,12 @@ class TestApplyRunner:
         site = Site()
         await context.route("https://jobs.test/**", site.handle)
         _, ask = scripted(Decision.SUBMITTED)
-        runner, service = make_runner(engine, tmp_path, ask, max_applications_per_day=1)
+        runner, service = make_runner(engine, tmp_path, ask, context, max_applications_per_day=1)
         first = await approved_app(engine, service, 1)
         second = await approved_app(engine, service, 2)
 
-        assert (await runner.process(context, first)).status is ApplicationStatus.SUBMITTED
-        outcome = await runner.process(context, second)
+        assert (await runner.process(first)).status is ApplicationStatus.SUBMITTED
+        outcome = await runner.process(second)
         assert outcome.stop is True
         assert "Daily cap" in outcome.detail
         assert site.requests == ["GET https://jobs.test/apply/1"]
@@ -190,10 +216,10 @@ class TestNotesStayTruthful:
         submitted yet"."""
         await context.route("https://jobs.test/**", Site().handle)
         _, ask = scripted(Decision.KEEP, Decision.SUBMITTED)
-        runner, service = make_runner(engine, tmp_path, ask)
+        runner, service = make_runner(engine, tmp_path, ask, context)
         app_id = await approved_app(engine, service)
-        await runner.process(context, app_id)
-        await runner.process(context, app_id)
+        await runner.process(app_id)
+        await runner.process(app_id)
         async with create_session_factory(engine)() as session:
             app = await ApplicationRepository(session).get(app_id)
         assert app is not None and app.status is ApplicationStatus.SUBMITTED
@@ -202,12 +228,12 @@ class TestNotesStayTruthful:
 
 class TestCrashRecovery:
     async def test_stale_awaiting_confirmation_is_resolved_by_asking(
-        self, engine: AsyncEngine, tmp_path: Path
+        self, engine: AsyncEngine, context: BrowserContext, tmp_path: Path
     ) -> None:
         """A previous `jobpilot apply` died with the browser open. Only the human
         knows if they clicked submit; never re-open it automatically."""
         _, ask = scripted()
-        runner, service = make_runner(engine, tmp_path, ask)
+        runner, service = make_runner(engine, tmp_path, ask, context)
         submitted_id = await approved_app(engine, service, 1)
         abandoned_id = await approved_app(engine, service, 2)
         stale = [await service.claim_for_autofill(i) for i in (submitted_id, abandoned_id)]
@@ -222,3 +248,214 @@ class TestCrashRecovery:
             submitted_id: ApplicationStatus.SUBMITTED,
             abandoned_id: ApplicationStatus.APPROVED,
         }
+
+
+LISTING = """<h1>Engineer</h1><p>Great job.</p>
+<button id="easy-apply" onclick="document.getElementById('form').hidden = false">Easy Apply</button>
+<a id="external" href="https://employer.test/apply" target="_blank">Apply on company site</a>
+<form id="form" hidden><label for="n">Full name</label><input id="n"></form>"""
+
+
+class ClickToApplyAdapter:
+    """Like a board adapter: reveals the form by clicking the board's Apply button."""
+
+    uses_browser = True
+
+    def __init__(self, fail_first: Exception | None = None) -> None:
+        self.calls = 0
+        self.fail_first = fail_first
+
+    async def open_application(self, page: Page, job: Job) -> Page:
+        self.calls += 1
+        await page.goto(job.application_url)
+        if self.fail_first is not None and self.calls == 1:
+            raise self.fail_first
+        await page.click("#easy-apply")
+        return page
+
+
+async def serve_listing(context: BrowserContext) -> None:
+    async def listing(route: Route) -> None:
+        await route.fulfill(body=LISTING, content_type="text/html")
+
+    async def employer(route: Route) -> None:
+        await route.fulfill(
+            body='<label for="e">Email</label><input id="e" type="email">',
+            content_type="text/html",
+        )
+
+    await context.route("https://jobs.test/**", listing)
+    await context.route("https://employer.test/**", employer)
+
+
+class TestAdapterDrivenApply:
+    async def test_adapter_reveals_the_form_then_autofill_fills_it(
+        self, engine: AsyncEngine, context: BrowserContext, tmp_path: Path
+    ) -> None:
+        await serve_listing(context)
+        seen, ask = scripted(Decision.SUBMITTED)
+        runner, service = make_runner(engine, tmp_path, ask, context, adapter=ClickToApplyAdapter())
+        outcome = await runner.process(await approved_app(engine, service))
+        assert outcome.status is ApplicationStatus.SUBMITTED
+        assert seen[0] is not None and seen[0].fields_filled.get("name") == "James Manon"
+
+    async def test_login_wall_keeps_the_window_open_and_recovers(
+        self, engine: AsyncEngine, context: BrowserContext, tmp_path: Path
+    ) -> None:
+        """Session expired mid-apply: not a failure. The human logs in in the same
+        window and presses f; JobPilot reopens the form and fills it."""
+        from jobpilot.database.repositories import PlatformSessionRepository
+        from jobpilot.platforms import SessionExpiredError
+
+        await serve_listing(context)
+        states: list[FillState] = []
+        queue = [Decision.REFILL, Decision.KEEP]
+
+        async def ask(application: Application, job: Job, state: FillState) -> Decision:
+            states.append(state)
+            return queue.pop(0)
+
+        adapter = ClickToApplyAdapter(fail_first=SessionExpiredError(JobSource.LINKEDIN))
+        runner, service = make_runner(engine, tmp_path, ask, context, adapter=adapter)
+        app_id = await approved_app(engine, service)
+        async with create_session_factory(engine)() as session:
+            from jobpilot.database.repositories import JobRepository as Jobs
+
+            job = await Jobs(session).get(1)
+        assert job is not None
+
+        outcome = await runner.process(app_id)
+        assert states[0].error and "log in" in states[0].error
+        assert states[1].result is not None and states[1].result.fields_filled.get("name")
+        assert outcome.status is ApplicationStatus.APPROVED  # kept, not failed
+        async with create_session_factory(engine)() as session:
+            saved = await PlatformSessionRepository(session).get(job.source)
+        assert saved is not None and saved.status.value == "needs_login"
+
+    async def test_refill_follows_the_human_to_the_employers_tab(
+        self, engine: AsyncEngine, context: BrowserContext, tmp_path: Path
+    ) -> None:
+        await serve_listing(context)
+        seen: list[FillState] = []
+
+        async def ask(application: Application, job: Job, state: FillState) -> Decision:
+            seen.append(state)
+            if len(seen) == 1:  # the human clicks "Apply on company site"
+                listing_page = [p for p in context.pages if "jobs.test" in p.url][0]
+                async with context.expect_page() as new_tab:
+                    await listing_page.click("#external")
+                await (await new_tab.value).wait_for_load_state()
+                return Decision.REFILL
+            return Decision.KEEP
+
+        runner, service = make_runner(engine, tmp_path, ask, context)
+        await runner.process(await approved_app(engine, service))
+        assert seen[1].result is not None
+        assert seen[1].result.url.startswith("https://employer.test")
+        assert seen[1].result.fields_filled.get("email") == "james@example.com"
+        assert all(p.is_closed() for p in context.pages)  # both tabs cleaned up
+
+
+class FakeProposer:
+    def __init__(self, answers: dict[str, str]) -> None:
+        self.answers = answers
+        self.asked: list[str] = []
+
+    async def propose(self, job: Job, questions: list[str]) -> dict[str, str]:
+        self.asked = questions
+        return self.answers
+
+
+QUESTION_FORM = """<label for="n">Full name</label><input id="n">
+<label for="q">Describe a project you're proud of</label><textarea id="q"></textarea>
+<label for="dob">Date of birth</label><input id="dob">"""
+
+
+class TestProposedAnswers:
+    async def _serve(self, context: BrowserContext) -> None:
+        async def form(route: Route) -> None:
+            await route.fulfill(body=QUESTION_FORM, content_type="text/html")
+
+        await context.route("https://jobs.test/**", form)
+
+    async def test_proposals_go_to_review_never_into_the_form(
+        self, engine: AsyncEngine, context: BrowserContext, tmp_path: Path
+    ) -> None:
+        await self._serve(context)
+        proposer = FakeProposer({"Describe a project you're proud of": "MoneyApp, a finance app."})
+        states: list[FillState] = []
+
+        async def ask(application: Application, job: Job, state: FillState) -> Decision:
+            states.append(state)
+            return Decision.PROPOSE
+
+        runner, service = make_runner(engine, tmp_path, ask, context, proposer=proposer)
+        app_id = await approved_app(engine, service)
+        outcome = await runner.process(app_id)
+
+        assert states[0].can_propose
+        assert proposer.asked == ["Describe a project you're proud of"]  # not the DOB field
+        assert outcome.status is ApplicationStatus.PENDING_REVIEW
+        async with create_session_factory(engine)() as session:
+            app = await ApplicationRepository(session).get(app_id)
+        assert app is not None
+        assert app.answers["Describe a project you're proud of"] == "MoneyApp, a finance app."
+        assert "proposed 1 answer" in app.notes
+
+    async def test_nothing_proposed_keeps_it_approved(
+        self, engine: AsyncEngine, context: BrowserContext, tmp_path: Path
+    ) -> None:
+        await self._serve(context)
+        _, ask = scripted(Decision.PROPOSE)
+        runner, service = make_runner(engine, tmp_path, ask, context, proposer=FakeProposer({}))
+        outcome = await runner.process(await approved_app(engine, service))
+        assert outcome.status is ApplicationStatus.APPROVED
+
+    async def test_propose_unavailable_without_an_llm(
+        self, engine: AsyncEngine, context: BrowserContext, tmp_path: Path
+    ) -> None:
+        await self._serve(context)
+        states: list[FillState] = []
+
+        async def ask(application: Application, job: Job, state: FillState) -> Decision:
+            states.append(state)
+            return Decision.PROPOSE  # ignored: not offered
+
+        runner, service = make_runner(engine, tmp_path, ask, context)
+        outcome = await runner.process(await approved_app(engine, service))
+        assert states[0].can_propose is False
+        assert outcome.status is ApplicationStatus.APPROVED
+
+
+class TestSessionControls:
+    async def test_pause_stops_before_opening_anything(
+        self, engine: AsyncEngine, context: BrowserContext, tmp_path: Path
+    ) -> None:
+        site = Site()
+        await context.route("https://jobs.test/**", site.handle)
+        _, ask = scripted()
+        runner, service = make_runner(engine, tmp_path, ask, context, paused=lambda: True)
+        outcome = await runner.process(await approved_app(engine, service))
+        assert outcome.stop and outcome.detail == "paused"
+        assert site.requests == []
+
+    async def test_platform_cap_skips_only_that_platform(
+        self, engine: AsyncEngine, context: BrowserContext, tmp_path: Path
+    ) -> None:
+        from jobpilot.config.preferences import PlatformSettings
+
+        await context.route("https://jobs.test/**", Site().handle)
+        _, ask = scripted(Decision.SUBMITTED, Decision.SUBMITTED)
+        runner, service = make_runner(
+            engine,
+            tmp_path,
+            ask,
+            context,
+            platforms={"remoteok": PlatformSettings(enabled=True, max_applications_per_day=1)},
+        )
+        first = await approved_app(engine, service, 1)
+        second = await approved_app(engine, service, 2)
+        assert (await runner.process(first)).status is ApplicationStatus.SUBMITTED
+        capped = await runner.process(second)
+        assert capped.stop is False  # other platforms may continue
+        assert "remoteok cap" in capped.detail

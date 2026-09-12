@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
-    from jobpilot.applications.runner import Decision, StaleDecision
+    from jobpilot.applications.runner import Decision, FillState, StaleDecision
     from jobpilot.autofill import FilledForm
     from jobpilot.config import Settings, UserPreferences
     from jobpilot.domain.enums import JobSource, SessionStatus
@@ -841,13 +841,11 @@ def _print_fill_summary(result: FilledForm | None, error: str | None) -> None:
         console.print(f"[dim]Screenshot: {result.screenshot_path}[/dim]")
 
 
-async def _ask_decision(
-    application: Application, job: Job, result: FilledForm | None, error: str | None
-) -> Decision:
+async def _ask_decision(application: Application, job: Job, state: FillState) -> Decision:
     from jobpilot.applications.runner import Decision
 
     console.rule(f"#{application.id} {job.title} @ {job.company}")
-    _print_fill_summary(result, error)
+    _print_fill_summary(state.result, state.error)
     console.print(
         "\nCheck every field in the browser window. [bold]Submit it yourself[/bold] on the "
         "site when you're satisfied — JobPilot never clicks submit."
@@ -859,21 +857,14 @@ async def _ask_decision(
         "r": Decision.REJECT,
         "q": Decision.QUIT,
     }
+    options = "[s] I submitted it  [f] fill this page again  [k] keep for later  "
+    if state.can_propose:
+        choices["p"] = Decision.PROPOSE
+        options += "[p] draft answers for the unknown questions (→ review)  "
+    options += "[r] reject  [q] quit > "
     while True:
-        choice = (
-            (
-                await asyncio.to_thread(
-                    console.input,
-                    # escape(): Rich would read "[s]" etc. as style tags and hide them.
-                    escape(
-                        "[s] I submitted it  [f] fill this page again  [k] keep for later  "
-                        "[r] reject  [q] quit > "
-                    ),
-                )
-            )
-            .strip()
-            .lower()
-        )
+        # escape(): Rich would read "[s]" etc. as style tags and hide them.
+        choice = (await asyncio.to_thread(console.input, escape(options))).strip().lower()
         if choice == "s":
             confirm = await asyncio.to_thread(
                 console.input, escape("Confirm you clicked the site's submit button [y/N] > ")
@@ -911,21 +902,21 @@ async def _ask_stale(application: Application, job: Job) -> StaleDecision:
 
 
 async def _run_apply(application_ids: list[int]) -> int:
-    from playwright.async_api import async_playwright
-
     from jobpilot.applications import ApplicationService, missing_applicant_fields
-    from jobpilot.applications.runner import ApplyRunner
+    from jobpilot.applications.answers import AnswerProposer
+    from jobpilot.applications.runner import ApplyRunner, BrowserPool, default_adapters
     from jobpilot.autofill import AutofillEngine
+    from jobpilot.control import is_paused
     from jobpilot.database import create_engine, create_session_factory
     from jobpilot.database.repositories import (
         ApplicationRepository,
         JobRepository,
         ResumeRepository,
     )
-    from jobpilot.domain.enums import ApplicationStatus
 
     settings = get_settings()
     preferences = _prefs()
+    _ensure_not_paused()
     missing = missing_applicant_fields(preferences.applicant)
     if missing:
         console.print(
@@ -950,6 +941,12 @@ async def _run_apply(application_ids: list[int]) -> int:
                     approved = await apps.list(status=ApplicationStatus.APPROVED, limit=500)
                     application_ids = [a.id for a in reversed(approved) if a.id is not None]
 
+            llm = await _configured_llm()
+            proposer = (
+                AnswerProposer(llm, preferences.applicant, resume.profile)
+                if llm is not None and resume is not None
+                else None
+            )
             service = ApplicationService(factory, preferences)
             autofill = AutofillEngine(
                 preferences.applicant,
@@ -957,28 +954,32 @@ async def _run_apply(application_ids: list[int]) -> int:
                 headless=False,
                 resume_file=resume.file_path if resume else None,
             )
-            runner = ApplyRunner(service, autofill, ask=_ask_decision, say=console.print)
-            if stale:
-                await runner.resolve_stale(stale, _ask_stale)
-            if not application_ids:
-                console.print(
-                    "No approved applications. Approve some with [bold]jobpilot review[/bold] "
-                    "or in the dashboard. (To prepare one for a job: jobpilot prepare <job_id>)"
+            async with BrowserPool(
+                _profiles(headless=False), default_adapters(preferences)
+            ) as browsers:
+                runner = ApplyRunner(
+                    service,
+                    autofill,
+                    browsers,
+                    ask=_ask_decision,
+                    say=console.print,
+                    proposer=proposer,
+                    paused=lambda: is_paused(settings.data_dir),
                 )
-                return 0
-
-            console.print(f"Opening {len(application_ids)} approved application(s)…")
-            async with async_playwright() as pw:
-                browser = await pw.chromium.launch(headless=False)
-                try:
-                    context = await browser.new_context(no_viewport=True)
-                    for app_id in application_ids:
-                        outcome = await runner.process(context, app_id)
-                        console.print(f"#{app_id}: {outcome.detail}")
-                        if outcome.stop:
-                            break
-                finally:
-                    await browser.close()
+                if stale:
+                    await runner.resolve_stale(stale, _ask_stale)
+                if not application_ids:
+                    console.print(
+                        "No approved applications. Approve some with [bold]jobpilot review[/bold] "
+                        "or in the dashboard. (To prepare one for a job: jobpilot prepare <job_id>)"
+                    )
+                    return 0
+                console.print(f"Opening {len(application_ids)} approved application(s)…")
+                for app_id in application_ids:
+                    outcome = await runner.process(app_id)
+                    console.print(f"#{app_id}: {outcome.detail}")
+                    if outcome.stop:
+                        break
     finally:
         await engine.dispose()
     return 0
