@@ -212,3 +212,75 @@ class TestScrapeRunnerResilience:
         assert by_id[stale.id].error is not None
         assert "interrupted" in by_id[stale.id].error
         assert by_id[stale.id].finished_at is not None
+
+
+class TestJobStatusFollowsThePipeline:
+    async def test_status_moves_with_matching_and_applications(self, engine: AsyncEngine) -> None:
+        from jobpilot.database.repositories import ApplicationRepository
+        from jobpilot.domain import Application, ApplicationStatus, JobStatus
+
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            jobs = JobRepository(session)
+            job, _ = await jobs.upsert(_job())
+            resume = await ResumeRepository(session).add(
+                Resume(version="v1", file_path="/r.pdf", is_active=True)
+            )
+            assert job.id is not None and resume.id is not None
+            assert job.status is JobStatus.DISCOVERED
+
+            await MatchResultRepository(session).upsert(
+                MatchResult(
+                    job_id=job.id,
+                    resume_id=resume.id,
+                    score=80,
+                    recommendation=MatchRecommendation.APPLY,
+                )
+            )
+            assert (await jobs.get(job.id)).status is JobStatus.MATCHED  # type: ignore[union-attr]
+
+            apps = ApplicationRepository(session)
+            app = await apps.create(Application(job_id=job.id, resume_id=resume.id))
+            assert app.id is not None
+            assert (await jobs.get(job.id)).status is JobStatus.PREPARED  # type: ignore[union-attr]
+            for step in (
+                ApplicationStatus.APPROVED,
+                ApplicationStatus.AWAITING_CONFIRMATION,
+                ApplicationStatus.SUBMITTED,
+            ):
+                await apps.transition(app.id, step)
+            assert (await jobs.get(job.id)).status is JobStatus.APPLIED  # type: ignore[union-attr]
+
+            # Re-scoring an applied job never demotes it.
+            await MatchResultRepository(session).upsert(
+                MatchResult(
+                    job_id=job.id,
+                    resume_id=resume.id,
+                    score=10,
+                    recommendation=MatchRecommendation.SKIP,
+                )
+            )
+            assert (await jobs.get(job.id)).status is JobStatus.APPLIED  # type: ignore[union-attr]
+
+    async def test_duplicates_are_never_scored(self, engine: AsyncEngine) -> None:
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            jobs = JobRepository(session)
+            original, _ = await jobs.upsert(_job(title="React Developer", url="https://a.com/1"))
+            dup, _ = await jobs.upsert(
+                Job(
+                    title="React Developer (Remote)",
+                    company="ACME Inc.",
+                    application_url="https://b.com/9",
+                    source=JobSource.LINKEDIN,
+                    external_id="9",
+                )
+            )
+            resume = await ResumeRepository(session).add(
+                Resume(version="v1", file_path="/r.pdf", is_active=True)
+            )
+            await session.commit()
+        async with factory() as session:
+            todo = await MatchResultRepository(session).unmatched_job_ids(resume.id)  # type: ignore[arg-type]
+        assert todo == [original.id]
+        assert dup.id not in todo

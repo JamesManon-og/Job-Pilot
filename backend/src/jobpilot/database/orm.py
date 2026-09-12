@@ -62,8 +62,13 @@ class Base(DeclarativeBase):
 class JobRow(Base):
     __tablename__ = "jobs"
     __table_args__ = (
+        # dedup_hash = hash of (source, external_id) or canonical URL: one row per posting.
         UniqueConstraint("dedup_hash", name="uq_jobs_dedup_hash"),
-        Index("ix_jobs_application_url", "application_url", unique=True),
+        Index("uq_jobs_source_external_id", "source", "external_id", unique=True),
+        Index("ix_jobs_application_url", "application_url"),
+        Index("ix_jobs_canonical_url", "canonical_url"),
+        Index("ix_jobs_fingerprint", "fingerprint"),
+        Index("ix_jobs_status", "status"),
         Index("ix_jobs_source", "source"),
         Index("ix_jobs_company", "company"),
     )
@@ -88,6 +93,13 @@ class JobRow(Base):
     date_posted: Mapped[datetime | None]
     scraped_at: Mapped[datetime]
     dedup_hash: Mapped[str] = mapped_column(String(64))
+    external_id: Mapped[str | None] = mapped_column(String(200))
+    canonical_url: Mapped[str] = mapped_column(String(2000), default="")
+    fingerprint: Mapped[str] = mapped_column(String(32), default="")
+    status: Mapped[str] = mapped_column(String(20), default="discovered")
+    status_reason: Mapped[str] = mapped_column(Text, default="")
+    duplicate_of_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id", ondelete="SET NULL"))
+    last_seen_at: Mapped[datetime | None]
 
 
 class ResumeRow(Base):
@@ -165,3 +177,16 @@ class ScrapeRunRow(Base):
     error: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime]
     finished_at: Mapped[datetime | None]
+
+
+class PlatformSessionRow(Base):
+    """Login bookkeeping per platform. Cookies live in the browser profile on
+    disk (data/browser-profiles/<platform>); no credentials are stored here."""
+
+    __tablename__ = "platform_sessions"
+
+    platform: Mapped[str] = mapped_column(String(30), primary_key=True)
+    status: Mapped[str] = mapped_column(String(20))
+    detail: Mapped[str] = mapped_column(Text, default="")
+    last_checked_at: Mapped[datetime | None]
+    last_login_at: Mapped[datetime | None]

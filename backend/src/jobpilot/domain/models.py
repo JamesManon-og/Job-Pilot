@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -12,24 +11,17 @@ from jobpilot.domain.enums import (
     EmploymentType,
     ExperienceLevel,
     JobSource,
+    JobStatus,
     MatchRecommendation,
     RemoteType,
     ScrapeRunStatus,
+    SessionStatus,
 )
+from jobpilot.domain.identity import canonicalize_url, identity_hash, job_fingerprint
 
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
-
-
-def compute_dedup_hash(company: str, title: str, application_url: str) -> str:
-    """Stable fingerprint for duplicate detection across scrape runs and sources.
-
-    Normalization (strip + casefold) means the same posting scraped twice —
-    or with cosmetic differences in casing/whitespace — hashes identically.
-    """
-    normalized = "|".join(part.strip().casefold() for part in (company, title, application_url))
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 class Job(BaseModel):
@@ -52,7 +44,16 @@ class Job(BaseModel):
     source: JobSource
     date_posted: datetime | None = None
     scraped_at: datetime = Field(default_factory=utcnow)
-    dedup_hash: str = ""
+    # Identity (see domain/identity.py). Derived when not given.
+    external_id: str | None = None  # the board's own id for the posting
+    canonical_url: str = ""
+    dedup_hash: str = ""  # hash of the identity key: (source, external_id) or canonical_url
+    fingerprint: str = ""  # normalized company+title: same job on another board
+    # Pipeline state, maintained by the repositories.
+    status: JobStatus = JobStatus.DISCOVERED
+    status_reason: str = ""
+    duplicate_of_id: int | None = None
+    last_seen_at: datetime | None = None
 
     @field_validator("application_url")
     @classmethod
@@ -64,10 +65,19 @@ class Job(BaseModel):
             raise ValueError(f"application_url must be an http(s) URL, got {value[:60]!r}")
         return value
 
+    @field_validator("external_id")
+    @classmethod
+    def _blank_id_is_none(cls, value: str | None) -> str | None:
+        return value.strip() or None if value is not None else None
+
     @model_validator(mode="after")
-    def _fill_dedup_hash(self) -> Job:
+    def _derive_identity(self) -> Job:
+        if not self.canonical_url:
+            self.canonical_url = canonicalize_url(self.application_url)
         if not self.dedup_hash:
-            self.dedup_hash = compute_dedup_hash(self.company, self.title, self.application_url)
+            self.dedup_hash = identity_hash(self.source.value, self.external_id, self.canonical_url)
+        if not self.fingerprint:
+            self.fingerprint = job_fingerprint(self.company, self.title)
         return self
 
 
@@ -162,3 +172,14 @@ class ScrapeRun(BaseModel):
     error: str | None = None
     started_at: datetime = Field(default_factory=utcnow)
     finished_at: datetime | None = None
+
+
+class PlatformSession(BaseModel):
+    """Saved-login bookkeeping for one platform. The login itself lives in the
+    platform's browser profile; no credentials are ever stored."""
+
+    platform: JobSource
+    status: SessionStatus = SessionStatus.UNKNOWN
+    detail: str = ""
+    last_checked_at: datetime | None = None
+    last_login_at: datetime | None = None

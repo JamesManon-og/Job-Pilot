@@ -80,6 +80,7 @@ def _parse_entry(entry: dict[str, Any]) -> Job | None:
         technologies=tags,
         application_url=url,
         source=JobSource.REMOTEOK,
+        external_id=str(entry.get("id") or "").strip() or None,
         date_posted=date_posted,
     )
 

@@ -17,8 +17,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from jobpilot.database.orm import ApplicationEventRow, ApplicationRow, JobRow, UTCDateTime
-from jobpilot.domain.enums import ApplicationStatus
+from jobpilot.domain.enums import ApplicationStatus, JobStatus
+from jobpilot.domain.identity import job_fingerprint
 from jobpilot.domain.models import Application, can_transition, utcnow
+
+_JOB_STATUS_FOR = {
+    ApplicationStatus.SUBMITTED: JobStatus.APPLIED,
+    ApplicationStatus.REJECTED: JobStatus.REJECTED,
+    ApplicationStatus.SKIPPED: JobStatus.SKIPPED,
+}
 
 
 class DuplicateApplicationError(Exception):
@@ -115,7 +122,15 @@ class ApplicationRepository:
             # caller must roll back the session before reusing it.
             raise DuplicateApplicationError(application.job_id) from exc
         await self.log_event(row.id, "created", {"status": row.status})
+        await self._sync_job_status(application.job_id, application.status)
         return _to_domain(row)
+
+    async def _sync_job_status(self, job_id: int, status: ApplicationStatus) -> None:
+        """The job's pipeline status follows its application's."""
+        job_status = _JOB_STATUS_FOR.get(status, JobStatus.PREPARED)
+        await self._session.execute(
+            update(JobRow).where(JobRow.id == job_id).values(status=job_status.value)
+        )
 
     async def exists_for_job(self, job_id: int) -> bool:
         result = await self._session.scalar(
@@ -124,15 +139,16 @@ class ApplicationRepository:
         return bool(result)
 
     async def exists_for_company_position(self, company: str, title: str) -> bool:
-        """Cross-source duplicate check: same company + position via the jobs table."""
+        """Cross-source duplicate check: an application for the same job on any board.
+
+        Compares normalized fingerprints, so "Acme Inc." / "ACME" and
+        "Sr. Engineer (Remote)" / "Senior Engineer" count as the same job.
+        """
         result = await self._session.scalar(
             select(func.count())
             .select_from(ApplicationRow)
             .join(JobRow, JobRow.id == ApplicationRow.job_id)
-            .where(
-                func.lower(func.trim(JobRow.company)) == company.strip().lower(),
-                func.lower(func.trim(JobRow.title)) == title.strip().lower(),
-            )
+            .where(JobRow.fingerprint == job_fingerprint(company, title))
         )
         return bool(result)
 
@@ -206,6 +222,7 @@ class ApplicationRepository:
         )
         updated = await self.get(application_id)
         assert updated is not None
+        await self._sync_job_status(updated.job_id, target)
         return updated
 
     async def update_status(
