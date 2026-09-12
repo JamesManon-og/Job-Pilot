@@ -62,13 +62,21 @@ class JobRepository:
         self._session = session
 
     async def upsert(self, job: Job) -> tuple[Job, bool]:
-        """Insert the job, or refresh the existing row with the same dedup_hash.
+        """Insert the job, or refresh the existing row for the same posting.
+
+        A posting is identified by dedup_hash, falling back to application_url:
+        boards edit titles in place, which changes the hash but not the URL, and
+        inserting that as a new row would violate the unique URL index.
 
         Returns (persisted job, created) where created is True for new rows.
         """
         existing = await self._session.scalar(
             select(JobRow).where(JobRow.dedup_hash == job.dedup_hash)
         )
+        if existing is None:
+            existing = await self._session.scalar(
+                select(JobRow).where(JobRow.application_url == job.application_url)
+            )
         if existing is not None:
             _apply_to_row(job, existing)
             await self._session.flush()

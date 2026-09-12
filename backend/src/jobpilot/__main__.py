@@ -1,9 +1,8 @@
 """JobPilot CLI: `python -m jobpilot <command>`.
 
-Commands:
-    db init    Create/upgrade the database schema (runs Alembic migrations).
-    db stats   Print row counts for every table.
-    config show  Print the resolved settings and user preferences.
+Run `python -m jobpilot --help` for the command list. Batch commands that
+write jobs/matches/applications (scrape, match, prepare, run) share one
+cross-process lock, so two of them can never race each other.
 """
 
 from __future__ import annotations
@@ -11,33 +10,66 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
+import subprocess
 import sys
+import tempfile
+from collections.abc import Iterable
+from contextlib import AbstractContextManager
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
+    from jobpilot.applications.runner import Decision, StaleDecision
+    from jobpilot.autofill import FilledForm
+    from jobpilot.config import Settings, UserPreferences
+    from jobpilot.domain.models import Application, Job
     from jobpilot.llm import OllamaClient
     from jobpilot.matcher import MatchService
 
 from alembic import command
 from alembic.config import Config as AlembicConfig
+from pydantic import ValidationError
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
-from jobpilot.config import get_settings, load_preferences
+from jobpilot.config import PreferencesError, get_settings, load_user_preferences
+from jobpilot.locks import PIPELINE_LOCK, LockBusyError, process_lock
 from jobpilot.logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
 console = Console()
 
+EXIT_CONFIG_ERROR = 2
+EXIT_BUSY = 3
+
 
 def _alembic_config() -> AlembicConfig:
-    backend_dir = Path(__file__).resolve().parents[2]
-    cfg = AlembicConfig(str(backend_dir / "alembic.ini"))
-    cfg.set_main_option("script_location", str(backend_dir / "migrations"))
-    return cfg
+    # Editable installs run from backend/src; installed copies (Docker) find
+    # the migrations via the project root instead.
+    candidates = [Path(__file__).resolve().parents[2], get_settings().backend_dir]
+    for backend_dir in candidates:
+        if (backend_dir / "alembic.ini").is_file():
+            cfg = AlembicConfig(str(backend_dir / "alembic.ini"))
+            cfg.set_main_option("script_location", str(backend_dir / "migrations"))
+            return cfg
+    raise FileNotFoundError(
+        "Cannot find alembic.ini. Looked in: "
+        + ", ".join(str(c) for c in candidates)
+        + ". Set JOBPILOT_PROJECT_ROOT to the directory containing backend/."
+    )
+
+
+def _pipeline_lock() -> AbstractContextManager[None]:
+    return process_lock(PIPELINE_LOCK, get_settings().locks_dir)
+
+
+def _prefs() -> UserPreferences:
+    return load_user_preferences(get_settings())
 
 
 def cmd_db_init() -> int:
@@ -58,11 +90,13 @@ async def _collect_stats() -> dict[str, int]:
     engine = create_engine(settings.database_url)
     session_factory = create_session_factory(engine)
     stats: dict[str, int] = {}
-    async with session_factory() as session:
-        for table in Base.metadata.sorted_tables:
-            count = await session.scalar(select(func.count()).select_from(table))
-            stats[table.name] = count or 0
-    await engine.dispose()
+    try:
+        async with session_factory() as session:
+            for table in Base.metadata.sorted_tables:
+                count = await session.scalar(select(func.count()).select_from(table))
+                stats[table.name] = count or 0
+    finally:
+        await engine.dispose()
     return stats
 
 
@@ -77,22 +111,26 @@ def cmd_db_stats() -> int:
     return 0
 
 
-async def _run_scrape(sources: list[str]) -> int:
+async def _run_scrape(source: str) -> int:
     from jobpilot.database import create_engine, create_session_factory
     from jobpilot.domain.enums import JobSource
     from jobpilot.domain.models import ScrapeRun
     from jobpilot.scrapers import ScrapeRunner, all_scrapers
 
     settings = get_settings()
-    preferences = load_preferences(settings.preferences_path)
+    preferences = _prefs()
+    targets = _resolve_sources(source, all_scrapers())
+    if targets is None:
+        return 1
     engine = create_engine(settings.database_url)
     runner = ScrapeRunner(create_session_factory(engine), preferences)
-
-    targets = list(all_scrapers()) if sources == ["all"] else [JobSource(name) for name in sources]
     results: list[ScrapeRun] = []
-    for source in targets:
-        results.append(await runner.run(source))
-    await engine.dispose()
+    try:
+        with _pipeline_lock():
+            for target in targets:
+                results.append(await runner.run(JobSource(target)))
+    finally:
+        await engine.dispose()
 
     table = Table(title="Scrape results")
     table.add_column("Source")
@@ -112,8 +150,16 @@ async def _run_scrape(sources: list[str]) -> int:
     return 0 if all(run.error is None for run in results) else 1
 
 
-def cmd_scrape(source: str) -> int:
-    return asyncio.run(_run_scrape([source]))
+def _resolve_sources(source: str, registered: Iterable[StrEnum]) -> list[str] | None:
+    names = [s.value for s in registered]
+    if source == "all":
+        return names
+    if source not in names:
+        console.print(
+            f"[red]Unknown source {source!r}.[/red] Available: {', '.join(names)} (or 'all')"
+        )
+        return None
+    return [source]
 
 
 async def _configured_llm() -> OllamaClient | None:
@@ -189,9 +235,11 @@ async def _run_resume_list() -> int:
     settings = get_settings()
     engine = create_engine(settings.database_url)
     factory = create_session_factory(engine)
-    async with factory() as session:
-        resumes = await ResumeRepository(session).list()
-    await engine.dispose()
+    try:
+        async with factory() as session:
+            resumes = await ResumeRepository(session).list()
+    finally:
+        await engine.dispose()
 
     table = Table(title="Resumes")
     table.add_column("ID", justify="right")
@@ -211,50 +259,65 @@ async def _run_resume_list() -> int:
     return 0
 
 
-async def _match_service() -> tuple[MatchService, AsyncEngine]:
+async def _match_service() -> tuple[MatchService, AsyncEngine] | None:
     from jobpilot.database import create_engine, create_session_factory
     from jobpilot.matcher import MatchEngine, MatchService
 
     settings = get_settings()
+    preferences = _prefs()
     llm = await _configured_llm()
     if llm is None:
         console.print(
             "[red]LLM not ready.[/red] Run [bold]jobpilot llm check[/bold] for diagnostics."
         )
-        raise SystemExit(1)
+        return None
     engine = create_engine(settings.database_url)
     service = MatchService(
-        create_session_factory(engine),
-        MatchEngine(llm, model_name=llm.model),
-        load_preferences(settings.preferences_path),
+        create_session_factory(engine), MatchEngine(llm, model_name=llm.model), preferences
     )
     return service, engine
 
 
 async def _run_match(job_id: int | None, limit: int) -> int:
-    from jobpilot.matcher import NoActiveResumeError
+    from jobpilot.llm import OllamaError
+    from jobpilot.matcher import MatchingAbortedError, NoActiveResumeError
 
-    service, engine = await _match_service()
+    built = await _match_service()
+    if built is None:
+        return 1
+    service, engine = built
     try:
-        if job_id is not None:
-            result = await service.match_one(job_id)
-            results = [result]
-        else:
-            results = await service.match_unscored(limit=limit)
-    except (NoActiveResumeError, ValueError) as exc:
+        with _pipeline_lock():
+            if job_id is not None:
+                results = [await service.match_one(job_id)]
+            else:
+                results = await service.match_unscored(limit=limit)
+    except MatchingAbortedError as exc:
+        console.print(f"[red]Matching stopped:[/red] {exc}")
+        console.print(f"[dim]{len(exc.scored)} job(s) scored before that were saved.[/dim]")
+        return 1
+    except (NoActiveResumeError, ValueError, OllamaError) as exc:
         console.print(f"[red]Error:[/red] {exc}")
         return 1
     finally:
         await engine.dispose()
 
     console.print(f"[green]Scored {len(results)} job(s).[/green]")
+    if service.last_failures:
+        console.print(
+            f"[yellow]{len(service.last_failures)} job(s) could not be scored and will be "
+            "retried next run (see logs).[/yellow]"
+        )
     return 0
 
 
 async def _run_rank(top: int, min_score: int) -> int:
     from jobpilot.matcher import NoActiveResumeError
 
-    service, engine = await _match_service()
+    built = await _match_service()
+    if built is None:
+        return 1
+    service, engine = built
     try:
         ranked = await service.ranked(min_score=min_score, top=top)
     except NoActiveResumeError as exc:
@@ -285,155 +348,393 @@ async def _run_rank(top: int, min_score: int) -> int:
     return 0
 
 
-async def _run_apply(job_id: int) -> int:
-    from jobpilot.applications import ApplicationService, DailyCapReachedError
+async def _run_prepare(job_id: int) -> int:
+    from jobpilot.applications import (
+        ApplicationService,
+        BlacklistedCompanyError,
+        DailyCapReachedError,
+    )
     from jobpilot.database import create_engine, create_session_factory
     from jobpilot.database.repositories import DuplicateApplicationError, ResumeRepository
 
     settings = get_settings()
-    preferences = load_preferences(settings.preferences_path)
+    preferences = _prefs()
     engine = create_engine(settings.database_url)
     factory = create_session_factory(engine)
-
-    async with factory() as session:
-        resume = await ResumeRepository(session).get_active()
-    if resume is None or resume.id is None:
-        console.print("[red]No active resume.[/red] Run: jobpilot resume import <path>")
-        await engine.dispose()
-        return 1
-
-    llm = await _configured_llm()
-    service = ApplicationService(factory, preferences, llm=llm)
-
     try:
-        application = await service.prepare(job_id, resume_id=resume.id)
-    except DuplicateApplicationError:
-        console.print("[yellow]Already applied to this job.[/yellow]")
-        await engine.dispose()
-        return 1
-    except DailyCapReachedError as exc:
+        async with factory() as session:
+            resume = await ResumeRepository(session).get_active()
+        if resume is None or resume.id is None:
+            console.print("[red]No active resume.[/red] Run: jobpilot resume import <path>")
+            return 1
+        llm = await _configured_llm()
+        if llm is None:
+            console.print("[yellow]LLM unavailable — preparing without a cover letter.[/yellow]")
+        service = ApplicationService(factory, preferences, llm=llm)
+        with _pipeline_lock():
+            application = await service.prepare(job_id, resume_id=resume.id)
+    except (DuplicateApplicationError, DailyCapReachedError, BlacklistedCompanyError) as exc:
         console.print(f"[yellow]{exc}[/yellow]")
-        await engine.dispose()
         return 1
     except ValueError as exc:
         console.print(f"[red]Error:[/red] {exc}")
-        await engine.dispose()
         return 1
+    finally:
+        await engine.dispose()
 
-    await engine.dispose()
     console.print(
         f"[green]Application #{application.id} prepared[/green] "
         f"(status: {application.status.value})"
     )
-    if application.cover_letter:
-        console.print(f"[dim]Cover letter: {len(application.cover_letter)} chars[/dim]")
-    if preferences.human_approval_enabled:
-        console.print("Review it in the dashboard, then approve to submit.")
+    if application.notes:
+        console.print(f"[yellow]{application.notes}[/yellow]")
+    console.print("Review it with [bold]jobpilot review[/bold] or in the dashboard.")
     return 0
 
 
 async def _run_pipeline(source: str, top: int, min_score: int) -> int:
     """Full pipeline: scrape → match → rank → prepare applications for top matches."""
-    from jobpilot.applications import ApplicationService, DailyCapReachedError
     from jobpilot.database import create_engine, create_session_factory
-    from jobpilot.database.repositories import (
-        DuplicateApplicationError,
-        ResumeRepository,
-    )
     from jobpilot.domain.enums import JobSource
-    from jobpilot.matcher import MatchEngine, MatchService, NoActiveResumeError
-    from jobpilot.scrapers import ScrapeRunner, all_scrapers
+    from jobpilot.pipeline import PipelineService
+    from jobpilot.scrapers import all_scrapers
 
     settings = get_settings()
-    preferences = load_preferences(settings.preferences_path)
+    preferences = _prefs()
+    targets = _resolve_sources(source, all_scrapers())
+    if targets is None:
+        return 1
     engine = create_engine(settings.database_url)
     factory = create_session_factory(engine)
-
-    # 1. Scrape
-    console.print("[bold]Step 1/4:[/bold] Scraping jobs…")
-    runner = ScrapeRunner(factory, preferences)
-    targets = list(all_scrapers()) if source == "all" else [JobSource(source)]
-    total_new = 0
-    for src in targets:
-        run = await runner.run(src)
-        console.print(f"  {src.value}: {run.jobs_new} new / {run.jobs_found} found")
-        total_new += run.jobs_new
-    console.print(f"  [green]{total_new} new jobs added.[/green]")
-
-    # 2. Match
-    console.print("[bold]Step 2/4:[/bold] Scoring with LLM…")
     llm = await _configured_llm()
-    if llm is None:
-        console.print("[yellow]LLM unavailable — skipping match/rank/apply.[/yellow]")
-        await engine.dispose()
-        return 0
-
-    async with factory() as session:
-        resume = await ResumeRepository(session).get_active()
-    if resume is None or resume.id is None:
-        console.print("[yellow]No active resume — skipping match/rank/apply.[/yellow]")
-        await engine.dispose()
-        return 0
-
-    match_service = MatchService(factory, MatchEngine(llm, model_name=llm.model), preferences)
-    try:
-        results = await match_service.match_unscored(limit=100)
-    except NoActiveResumeError:
-        console.print("[yellow]No active resume.[/yellow]")
-        await engine.dispose()
-        return 0
-    console.print(f"  [green]Scored {len(results)} jobs.[/green]")
-
-    # 3. Rank
-    console.print("[bold]Step 3/4:[/bold] Ranking…")
-    ranked = await match_service.ranked(min_score=min_score, top=top)
-    if not ranked:
-        console.print("  No matches above threshold.")
-        await engine.dispose()
-        return 0
-    for i, entry in enumerate(ranked, 1):
-        console.print(
-            f"  {i}. {entry.job.title} @ {entry.job.company} (score: {entry.composite_score:.2f})"
-        )
-
-    # 4. Prepare applications
-    console.print("[bold]Step 4/4:[/bold] Preparing applications…")
-    app_service = ApplicationService(factory, preferences, llm=llm)
-    prepared = 0
-    for entry in ranked:
-        assert entry.job.id is not None
-        try:
-            app = await app_service.prepare(entry.job.id, resume_id=resume.id)
-            console.print(
-                f"  [green]Prepared #{app.id}[/green] — {entry.job.title} @ {entry.job.company}"
-            )
-            prepared += 1
-        except DuplicateApplicationError:
-            console.print(f"  [dim]Already applied — {entry.job.title} @ {entry.job.company}[/dim]")
-        except DailyCapReachedError:
-            console.print("  [yellow]Daily cap reached — stopping.[/yellow]")
-            break
-
-    await engine.dispose()
+    pipeline = PipelineService(factory, preferences, llm=llm, model_name=llm.model if llm else "")
+    threshold = max(preferences.min_match_score, min_score)
     console.print(
-        f"\n[bold green]Pipeline complete.[/bold green] {prepared} applications prepared."
+        f"[bold]Pipeline[/bold]: scrape {', '.join(targets)} → match → rank "
+        f"(LLM score ≥ {threshold}) → prepare top {top}"
     )
-    if preferences.human_approval_enabled and prepared > 0:
-        console.print("Review them in the dashboard, then approve to submit.")
+    try:
+        with _pipeline_lock():
+            report = await pipeline.run(
+                [JobSource(t) for t in targets], top=top, min_score=min_score
+            )
+    finally:
+        await engine.dispose()
+
+    for run in report.scrape_runs:
+        status = "[green]ok[/green]" if run.error is None else f"[red]failed: {run.error}[/red]"
+        console.print(
+            f"  scrape {run.source.value}: {run.jobs_new} new / {run.jobs_found} found — {status}"
+        )
+    console.print(f"  scored {report.scored} job(s)")
+    if report.score_failures:
+        console.print(
+            f"  [yellow]{report.score_failures} job(s) failed to score (retried next run)[/yellow]"
+        )
+    for reason in report.skipped:
+        console.print(f"  [dim]skipped {reason}[/dim]")
+    for app_id in report.prepared:
+        console.print(f"  [green]prepared application #{app_id}[/green]")
+    if report.stopped_early:
+        console.print(f"[yellow]{report.stopped_early}[/yellow]")
+    elif not report.candidates:
+        console.print(f"  No unapplied matches with LLM score ≥ {threshold}.")
+    console.print(
+        f"\n[bold green]Pipeline complete.[/bold green] {len(report.prepared)} application(s) "
+        "prepared."
+    )
+    if report.prepared:
+        console.print(
+            "Next: [bold]jobpilot review[/bold] (or the dashboard), then "
+            "[bold]jobpilot apply[/bold]."
+        )
+    failed_scrapes = any(run.error for run in report.scrape_runs)
+    return 1 if failed_scrapes and not report.prepared else 0
+
+
+def _edit_in_editor(text: str) -> str:
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nano"
+    fd, name = tempfile.mkstemp(suffix=".txt", prefix="jobpilot-cover-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        subprocess.run([*editor.split(), name], check=False)
+        return Path(name).read_text(encoding="utf-8")
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+async def _run_review() -> int:
+    """Interactive terminal review of pending applications."""
+    from jobpilot.applications import ApplicationService, InvalidTransitionError
+    from jobpilot.database import create_engine, create_session_factory
+    from jobpilot.database.repositories import ApplicationRepository, JobRepository
+    from jobpilot.domain.enums import ApplicationStatus
+
+    settings = get_settings()
+    engine = create_engine(settings.database_url)
+    factory = create_session_factory(engine)
+    service = ApplicationService(factory, _prefs())
+    try:
+        async with factory() as session:
+            pending = list(
+                reversed(
+                    await ApplicationRepository(session).list(
+                        status=ApplicationStatus.PENDING_REVIEW, limit=500
+                    )
+                )
+            )
+            jobs = {a.job_id: await JobRepository(session).get(a.job_id) for a in pending}
+        if not pending:
+            console.print("Nothing to review.")
+            return 0
+        for application in pending:
+            assert application.id is not None
+            job = jobs[application.job_id]
+            while True:
+                console.rule(f"Application #{application.id}")
+                if job is not None:
+                    console.print(f"[bold]{job.title}[/bold] @ {job.company}  ({job.source.value})")
+                    console.print(f"[link={job.application_url}]{job.application_url}[/link]")
+                if application.notes:
+                    console.print(f"[yellow]{application.notes}[/yellow]")
+                console.print("\n[bold]Cover letter[/bold]")
+                console.print(application.cover_letter or "[dim](empty)[/dim]")
+                for question, answer in application.answers.items():
+                    console.print(f"\n[bold]{question}[/bold]\n{answer}")
+                choice = (
+                    (
+                        await asyncio.to_thread(
+                            console.input,
+                            escape("\n[a]pprove  [r]eject  [e]dit cover letter  [s]kip  [q]uit > "),
+                        )
+                    )
+                    .strip()
+                    .lower()
+                )
+                try:
+                    if choice == "a":
+                        await service.approve(application.id)
+                        console.print("[green]Approved.[/green]")
+                    elif choice == "r":
+                        await service.reject(application.id)
+                        console.print("Rejected.")
+                    elif choice == "e":
+                        edited = await asyncio.to_thread(_edit_in_editor, application.cover_letter)
+                        async with factory() as session:
+                            application = await ApplicationRepository(session).update_materials(
+                                application.id, cover_letter=edited
+                            )
+                            await session.commit()
+                        continue
+                    elif choice == "q":
+                        return 0
+                    elif choice != "s":
+                        continue
+                except InvalidTransitionError as exc:
+                    console.print(f"[yellow]{exc} (changed elsewhere)[/yellow]")
+                break
+        console.print("Done. Run [bold]jobpilot apply[/bold] to open approved applications.")
+        return 0
+    finally:
+        await engine.dispose()
+
+
+def _print_fill_summary(result: FilledForm | None, error: str | None) -> None:
+    if error:
+        console.print(f"[red]Autofill problem:[/red] {error}")
+    if result is None:
+        return
+    if result.blocker:
+        console.print(
+            f"[bold yellow]This page is a {result.blocker} wall.[/bold yellow] JobPilot won't "
+            "touch it. Handle it yourself in the browser, then choose \\[f] to fill again."
+        )
+        return
+    if result.fields_filled:
+        console.print("[green]Filled:[/green] " + ", ".join(sorted(result.fields_filled)))
+    if result.fields_skipped:
+        console.print("[yellow]Answer these yourself:[/yellow]")
+        for label in result.fields_skipped:
+            console.print(f"  • {label}")
+    if result.sensitive_skipped:
+        console.print(
+            "[yellow]Sensitive — left for you:[/yellow] " + ", ".join(result.sensitive_skipped)
+        )
+    if result.required_unfilled:
+        console.print("[bold red]Still required before submitting:[/bold red]")
+        for label in result.required_unfilled:
+            console.print(f"  • {label}")
+    if result.resume_problem:
+        console.print(f"[yellow]Resume not attached:[/yellow] {result.resume_problem}")
+    if result.captcha_present:
+        console.print("[yellow]There's a CAPTCHA — complete it yourself.[/yellow]")
+    if result.screenshot_path:
+        console.print(f"[dim]Screenshot: {result.screenshot_path}[/dim]")
+
+
+async def _ask_decision(
+    application: Application, job: Job, result: FilledForm | None, error: str | None
+) -> Decision:
+    from jobpilot.applications.runner import Decision
+
+    console.rule(f"#{application.id} {job.title} @ {job.company}")
+    _print_fill_summary(result, error)
+    console.print(
+        "\nCheck every field in the browser window. [bold]Submit it yourself[/bold] on the "
+        "site when you're satisfied — JobPilot never clicks submit."
+    )
+    choices = {
+        "s": Decision.SUBMITTED,
+        "f": Decision.REFILL,
+        "k": Decision.KEEP,
+        "r": Decision.REJECT,
+        "q": Decision.QUIT,
+    }
+    while True:
+        choice = (
+            (
+                await asyncio.to_thread(
+                    console.input,
+                    # escape(): Rich would read "[s]" etc. as style tags and hide them.
+                    escape(
+                        "[s] I submitted it  [f] fill this page again  [k] keep for later  "
+                        "[r] reject  [q] quit > "
+                    ),
+                )
+            )
+            .strip()
+            .lower()
+        )
+        if choice == "s":
+            confirm = await asyncio.to_thread(
+                console.input, escape("Confirm you clicked the site's submit button [y/N] > ")
+            )
+            if confirm.strip().lower() != "y":
+                continue
+        if choice in choices:
+            return choices[choice]
+
+
+async def _ask_stale(application: Application, job: Job) -> StaleDecision:
+    from jobpilot.applications.runner import StaleDecision
+
+    console.print(
+        f"[yellow]Application #{application.id} ({job.title} @ {job.company}) was open in a "
+        "browser when a previous `jobpilot apply` ended.[/yellow]"
+    )
+    while True:
+        choice = (
+            (
+                await asyncio.to_thread(
+                    console.input,
+                    escape("Did you submit it? [y] yes  [n] no, keep it approved  [r] reject > "),
+                )
+            )
+            .strip()
+            .lower()
+        )
+        if choice == "y":
+            return StaleDecision.SUBMITTED
+        if choice == "n":
+            return StaleDecision.NOT_SUBMITTED
+        if choice == "r":
+            return StaleDecision.REJECT
+
+
+async def _run_apply(application_ids: list[int]) -> int:
+    from playwright.async_api import async_playwright
+
+    from jobpilot.applications import ApplicationService, missing_applicant_fields
+    from jobpilot.applications.runner import ApplyRunner
+    from jobpilot.autofill import AutofillEngine
+    from jobpilot.database import create_engine, create_session_factory
+    from jobpilot.database.repositories import (
+        ApplicationRepository,
+        JobRepository,
+        ResumeRepository,
+    )
+    from jobpilot.domain.enums import ApplicationStatus
+
+    settings = get_settings()
+    preferences = _prefs()
+    missing = missing_applicant_fields(preferences.applicant)
+    if missing:
+        console.print(
+            f"[red]Missing applicant info:[/red] set applicant.{', applicant.'.join(missing)} "
+            f"in {settings.preferences_path} first."
+        )
+        return EXIT_CONFIG_ERROR
+    engine = create_engine(settings.database_url)
+    factory = create_session_factory(engine)
+    try:
+        with process_lock("apply", settings.locks_dir):
+            async with factory() as session:
+                apps = ApplicationRepository(session)
+                jobs = JobRepository(session)
+                resume = await ResumeRepository(session).get_active()
+                stale = [
+                    (a, job)
+                    for a in await apps.list(status=ApplicationStatus.AWAITING_CONFIRMATION)
+                    if (job := await jobs.get(a.job_id)) is not None
+                ]
+                if not application_ids:
+                    approved = await apps.list(status=ApplicationStatus.APPROVED, limit=500)
+                    application_ids = [a.id for a in reversed(approved) if a.id is not None]
+
+            service = ApplicationService(factory, preferences)
+            autofill = AutofillEngine(
+                preferences.applicant,
+                settings.screenshots_dir,
+                headless=False,
+                resume_file=resume.file_path if resume else None,
+            )
+            runner = ApplyRunner(service, autofill, ask=_ask_decision, say=console.print)
+            if stale:
+                await runner.resolve_stale(stale, _ask_stale)
+            if not application_ids:
+                console.print(
+                    "No approved applications. Approve some with [bold]jobpilot review[/bold] "
+                    "or in the dashboard. (To prepare one for a job: jobpilot prepare <job_id>)"
+                )
+                return 0
+
+            console.print(f"Opening {len(application_ids)} approved application(s)…")
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=False)
+                try:
+                    context = await browser.new_context(no_viewport=True)
+                    for app_id in application_ids:
+                        outcome = await runner.process(context, app_id)
+                        console.print(f"#{app_id}: {outcome.detail}")
+                        if outcome.stop:
+                            break
+                finally:
+                    await browser.close()
+    finally:
+        await engine.dispose()
     return 0
 
 
 def cmd_config_show() -> int:
     settings = get_settings()
-    preferences = load_preferences(settings.preferences_path)
+    preferences = _prefs()
     console.print("[bold]Settings[/bold]")
     console.print_json(settings.model_dump_json())
     console.print("[bold]Preferences[/bold]")
     console.print_json(preferences.model_dump_json())
+    from jobpilot.applications import missing_applicant_fields
+
+    missing = missing_applicant_fields(preferences.applicant)
+    if missing:
+        console.print(
+            f"[yellow]Applying needs applicant.{', applicant.'.join(missing)} — "
+            f"edit {settings.preferences_path}[/yellow]"
+        )
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="jobpilot")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -467,29 +768,57 @@ def main(argv: list[str] | None = None) -> int:
 
     match_parser = subparsers.add_parser("match", help="score jobs against the active resume")
     match_parser.add_argument("--job-id", type=int, help="score a single job")
-    match_parser.add_argument("--limit", type=int, default=100, help="max jobs to score")
+    match_parser.add_argument("--limit", type=_positive_int, default=100, help="max jobs to score")
 
     rank_parser = subparsers.add_parser("rank", help="show ranked matches")
-    rank_parser.add_argument("--top", type=int, default=20)
-    rank_parser.add_argument("--min-score", type=int, default=0)
+    rank_parser.add_argument("--top", type=_positive_int, default=20)
+    rank_parser.add_argument("--min-score", type=_score, default=0, help="minimum LLM score 0-100")
 
-    apply_parser = subparsers.add_parser("apply", help="prepare an application for a job")
-    apply_parser.add_argument("job_id", type=int, help="job ID to apply to")
+    prepare_parser = subparsers.add_parser(
+        "prepare", help="generate materials for a job and queue it for review"
+    )
+    prepare_parser.add_argument("job_id", type=int, help="job ID (see `jobpilot rank`)")
+
+    subparsers.add_parser("review", help="review prepared applications in the terminal")
+
+    apply_parser = subparsers.add_parser(
+        "apply", help="open approved applications in a browser and autofill them"
+    )
+    apply_parser.add_argument(
+        "application_ids", type=int, nargs="*", help="application IDs (default: all approved)"
+    )
 
     run_parser = subparsers.add_parser("run", help="full pipeline: scrape → match → rank → prepare")
     run_parser.add_argument("--source", default="all")
-    run_parser.add_argument("--top", type=int, default=5, help="prepare top N matches")
-    run_parser.add_argument("--min-score", type=int, default=0, help="minimum composite score")
+    run_parser.add_argument("--top", type=_positive_int, default=5, help="prepare top N matches")
+    run_parser.add_argument(
+        "--min-score",
+        type=_score,
+        default=0,
+        help="minimum LLM score 0-100 (can only raise min_match_score from config.yaml)",
+    )
 
     serve_parser = subparsers.add_parser("serve", help="run the dashboard API server")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8000)
+    return parser
 
-    args = parser.parse_args(argv)
 
-    settings = get_settings()
-    setup_logging(settings.log_level, settings.logs_dir / "jobpilot.log")
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
 
+
+def _score(value: str) -> int:
+    number = int(value)
+    if not 0 <= number <= 100:
+        raise argparse.ArgumentTypeError("must be between 0 and 100")
+    return number
+
+
+def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "db" and args.db_command == "init":
         return cmd_db_init()
     if args.command == "db" and args.db_command == "stats":
@@ -497,7 +826,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "config" and args.config_command == "show":
         return cmd_config_show()
     if args.command == "scrape":
-        return cmd_scrape(args.source)
+        return asyncio.run(_run_scrape(args.source))
     if args.command == "resume" and args.resume_command == "import":
         return asyncio.run(_run_resume_import(args.path, args.version, not args.no_activate))
     if args.command == "resume" and args.resume_command == "list":
@@ -508,8 +837,12 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_run_match(args.job_id, args.limit))
     if args.command == "rank":
         return asyncio.run(_run_rank(args.top, args.min_score))
+    if args.command == "prepare":
+        return asyncio.run(_run_prepare(args.job_id))
+    if args.command == "review":
+        return asyncio.run(_run_review())
     if args.command == "apply":
-        return asyncio.run(_run_apply(args.job_id))
+        return asyncio.run(_run_apply(args.application_ids))
     if args.command == "run":
         return asyncio.run(_run_pipeline(args.source, args.top, args.min_score))
     if args.command == "serve":
@@ -519,8 +852,28 @@ def main(argv: list[str] | None = None) -> int:
 
         uvicorn.run(create_app(), host=args.host, port=args.port, log_level="info")
         return 0
-    parser.error("unknown command")
-    return 2
+    raise AssertionError(f"unhandled command {args.command}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    try:
+        settings: Settings = get_settings()
+    except ValidationError as exc:
+        console.print(f"[red]Invalid JOBPILOT_* environment settings:[/red]\n{exc}")
+        return EXIT_CONFIG_ERROR
+    setup_logging(settings.log_level, settings.logs_dir / "jobpilot.log")
+    try:
+        return _dispatch(args)
+    except PreferencesError as exc:
+        console.print(f"[red]Configuration error:[/red] {exc}")
+        return EXIT_CONFIG_ERROR
+    except LockBusyError as exc:
+        console.print(f"[yellow]{exc}[/yellow]")
+        return EXIT_BUSY
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted.[/yellow] Progress so far is saved.")
+        return 130
 
 
 if __name__ == "__main__":

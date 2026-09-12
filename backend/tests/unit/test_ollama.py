@@ -85,3 +85,45 @@ class TestOllamaClient:
 
         client = OllamaClient(base_url="http://testserver", transport=httpx.MockTransport(handler))
         assert await client.has_model() is True
+
+
+class TestOllamaRobustness:
+    async def test_reasoning_blocks_are_stripped(self) -> None:
+        """qwen3 emits <think>…</think> when the server ignores think:false;
+        it must never end up in a cover letter."""
+        client = make_client("<think>Let me plan this letter.</think>\n\nDear team,")
+        assert await client.generate("write") == "Dear team,"
+
+    async def test_json_after_reasoning_block_still_parses(self) -> None:
+        client = make_client('<think>hmm</think>{"score": 71}')
+        assert await client.generate_json("score") == {"score": 71}
+
+    async def test_unreachable_server_raises_unavailable(self) -> None:
+        from jobpilot.llm import OllamaUnavailableError
+
+        def refuse(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection refused", request=request)
+
+        client = OllamaClient(
+            base_url="http://testserver", attempts=3, transport=httpx.MockTransport(refuse)
+        )
+        with pytest.raises(OllamaUnavailableError, match="Cannot reach Ollama"):
+            await client.generate("hi")
+
+    async def test_non_json_http_body_is_an_ollama_error(self) -> None:
+        client = OllamaClient(
+            base_url="http://testserver",
+            attempts=1,
+            transport=httpx.MockTransport(lambda r: httpx.Response(200, text="<html>proxy</html>")),
+        )
+        with pytest.raises(OllamaError):
+            await client.generate("hi")
+
+    async def test_malformed_message_shape_is_an_ollama_error(self) -> None:
+        client = OllamaClient(
+            base_url="http://testserver",
+            attempts=1,
+            transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"message": "hi"})),
+        )
+        with pytest.raises(OllamaError):
+            await client.generate("hi")

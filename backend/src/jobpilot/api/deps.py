@@ -8,7 +8,7 @@ from typing import Annotated
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from jobpilot.config import Settings, UserPreferences, get_settings, load_preferences
+from jobpilot.config import Settings, UserPreferences, get_settings, load_user_preferences
 from jobpilot.database import create_engine, create_session_factory
 
 
@@ -22,7 +22,7 @@ class AppState:
 
     def preferences(self) -> UserPreferences:
         # Re-read on each call so config.yaml edits apply without restart.
-        return load_preferences(self.settings.preferences_path)
+        return load_user_preferences(self.settings)
 
     async def dispose(self) -> None:
         await self.engine.dispose()

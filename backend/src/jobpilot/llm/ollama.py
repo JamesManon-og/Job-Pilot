@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -14,6 +15,22 @@ logger = logging.getLogger(__name__)
 
 class OllamaError(Exception):
     """Raised when the Ollama server is unreachable or returns garbage."""
+
+
+class OllamaUnavailableError(OllamaError):
+    """The server can't be reached at all; retrying other jobs is pointless."""
+
+
+# Reasoning models (qwen3, deepseek-r1) emit <think>…</think> preambles; older
+# Ollama versions ignore `think: false`, so strip them defensively.
+_THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+
+
+def strip_reasoning(text: str) -> str:
+    text = _THINK_BLOCK.sub("", text)
+    if "</think>" in text.lower():  # unterminated opening tag: keep what follows
+        text = re.split(r"</think>", text, flags=re.IGNORECASE)[-1]
+    return text.strip()
 
 
 class OllamaClient:
@@ -65,15 +82,24 @@ class OllamaClient:
                     response = await client.post(f"{self._base_url}/api/chat", json=payload)
                     response.raise_for_status()
                     data = response.json()
-                content = data.get("message", {}).get("content", "")
-                if not isinstance(content, str) or not content.strip():
+                message = data.get("message") if isinstance(data, dict) else None
+                content = message.get("content", "") if isinstance(message, dict) else ""
+                if not isinstance(content, str):
+                    raise OllamaError(f"Malformed response from model {self._model}")
+                content = strip_reasoning(content)
+                if not content:
                     raise OllamaError(f"Empty response from model {self._model}")
                 return content
             except httpx.ConnectError as exc:
-                raise OllamaError(
+                raise OllamaUnavailableError(
                     f"Cannot reach Ollama at {self._base_url}. Is it running? "
                     "(brew services start ollama)"
                 ) from exc
+            except ValueError as exc:  # response body wasn't JSON
+                last_error = OllamaError(f"Non-JSON response from Ollama: {exc}")
+                if attempt < self._attempts - 1:
+                    await asyncio.sleep(2.0)
+                continue
             except (httpx.HTTPError, OllamaError) as exc:
                 last_error = exc
                 if attempt < self._attempts - 1:

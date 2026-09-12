@@ -30,11 +30,15 @@ def _html_to_text(html: str) -> str:
     return BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True)
 
 
+def _text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _parse_entry(entry: dict[str, Any]) -> Job | None:
-    position = (entry.get("position") or "").strip()
-    company = (entry.get("company") or "").strip()
-    url = (entry.get("url") or entry.get("apply_url") or "").strip()
-    if not position or not company or not url:
+    position = _text(entry.get("position"))
+    company = _text(entry.get("company"))
+    url = _text(entry.get("url")) or _text(entry.get("apply_url"))
+    if not position or not company or not url.startswith(("http://", "https://")):
         return None
 
     date_posted: datetime | None = None
@@ -42,7 +46,7 @@ def _parse_entry(entry: dict[str, Any]) -> Job | None:
     if epoch:
         try:
             date_posted = datetime.fromtimestamp(int(epoch), tz=UTC)
-        except (ValueError, OSError):
+        except (ValueError, OSError, OverflowError):
             date_posted = None
 
     def _int_or_none(value: Any) -> int | None:
@@ -57,17 +61,22 @@ def _parse_entry(entry: dict[str, Any]) -> Job | None:
     if salary_min or salary_max:
         salary_raw = f"${salary_min or '?'} - ${salary_max or '?'}"
 
-    tags = [str(tag).strip().lower() for tag in entry.get("tags") or [] if str(tag).strip()]
+    raw_tags = entry.get("tags")
+    if isinstance(raw_tags, str):  # a bare string would otherwise iterate as characters
+        raw_tags = raw_tags.split(",")
+    if not isinstance(raw_tags, list):
+        raw_tags = []
+    tags = [str(tag).strip().lower() for tag in raw_tags if str(tag).strip()]
 
     return Job(
         title=position,
         company=company,
-        location=(entry.get("location") or "").strip() or None,
+        location=_text(entry.get("location")) or None,
         salary_raw=salary_raw,
         salary_min=salary_min,
         salary_max=salary_max,
         remote=RemoteType.REMOTE,
-        description=_html_to_text(entry.get("description") or ""),
+        description=_html_to_text(_text(entry.get("description"))),
         technologies=tags,
         application_url=url,
         source=JobSource.REMOTEOK,
@@ -96,7 +105,13 @@ class RemoteOKScraper(BaseScraper):
                 continue
             if "legal" in entry and "position" not in entry:
                 continue  # first element is the API's legal notice
-            job = _parse_entry(entry)
+            try:
+                job = _parse_entry(entry)
+            except Exception:  # noqa: BLE001 - one malformed listing must not kill the scrape
+                logger.warning(
+                    "Skipping malformed RemoteOK entry %s", entry.get("id"), exc_info=True
+                )
+                continue
             if job is None:
                 logger.debug("Skipping incomplete RemoteOK entry: %s", entry.get("id"))
                 continue

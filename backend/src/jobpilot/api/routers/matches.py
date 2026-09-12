@@ -6,11 +6,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from jobpilot.api.deps import SessionDep, StateDep
-from jobpilot.database.repositories import (
-    JobRepository,
-    MatchResultRepository,
-    ResumeRepository,
-)
+from jobpilot.database.repositories import MatchResultRepository, ResumeRepository
 from jobpilot.domain.models import Job, MatchResult
 from jobpilot.matcher.ranking import rank_jobs
 
@@ -34,14 +30,7 @@ async def list_matches(
     if resume is None or resume.id is None:
         raise HTTPException(status_code=409, detail="No active resume imported yet")
 
-    matches = await MatchResultRepository(session).list_for_resume(resume.id, min_score=min_score)
-    jobs_repo = JobRepository(session)
-    pairs: list[tuple[Job, MatchResult]] = []
-    for match in matches:
-        job = await jobs_repo.get(match.job_id)
-        if job is not None:
-            pairs.append((job, match))
-
+    pairs = await MatchResultRepository(session).list_with_jobs(resume.id, min_score=min_score)
     preferences = state.preferences()
     ranked = rank_jobs(
         pairs,
@@ -51,5 +40,5 @@ async def list_matches(
     )
     return [
         RankedMatch(job=r.job, match=r.match, composite_score=r.composite_score)
-        for r in ranked[: min(top, 200)]
+        for r in ranked[: max(0, min(top, 200))]
     ]

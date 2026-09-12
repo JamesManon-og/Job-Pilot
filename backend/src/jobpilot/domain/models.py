@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from jobpilot.domain.enums import (
     ApplicationStatus,
@@ -54,6 +54,16 @@ class Job(BaseModel):
     scraped_at: datetime = Field(default_factory=utcnow)
     dedup_hash: str = ""
 
+    @field_validator("application_url")
+    @classmethod
+    def _require_http_url(cls, value: str) -> str:
+        # Scraped data is untrusted: the dashboard renders this as a link, so a
+        # javascript:/data: URL must never get in.
+        value = value.strip()
+        if not value.lower().startswith(("http://", "https://")):
+            raise ValueError(f"application_url must be an http(s) URL, got {value[:60]!r}")
+        return value
+
     @model_validator(mode="after")
     def _fill_dedup_hash(self) -> Job:
         if not self.dedup_hash:
@@ -93,6 +103,40 @@ class MatchResult(BaseModel):
     reasoning: str = ""
     llm_model: str = ""
     created_at: datetime = Field(default_factory=utcnow)
+
+
+# The only legal application lifecycle moves. Every status change goes through
+# ApplicationRepository.transition(), which enforces this table atomically, so
+# no code path can skip human approval or submit the same application twice.
+APPLICATION_TRANSITIONS: dict[ApplicationStatus, frozenset[ApplicationStatus]] = {
+    ApplicationStatus.PENDING_REVIEW: frozenset(
+        {ApplicationStatus.APPROVED, ApplicationStatus.REJECTED, ApplicationStatus.SKIPPED}
+    ),
+    ApplicationStatus.APPROVED: frozenset(
+        {
+            ApplicationStatus.AWAITING_CONFIRMATION,
+            ApplicationStatus.PENDING_REVIEW,
+            ApplicationStatus.REJECTED,
+        }
+    ),
+    ApplicationStatus.AWAITING_CONFIRMATION: frozenset(
+        {
+            ApplicationStatus.SUBMITTED,
+            ApplicationStatus.APPROVED,
+            ApplicationStatus.PENDING_REVIEW,
+            ApplicationStatus.FAILED,
+            ApplicationStatus.REJECTED,
+        }
+    ),
+    ApplicationStatus.FAILED: frozenset({ApplicationStatus.APPROVED, ApplicationStatus.REJECTED}),
+    ApplicationStatus.SUBMITTED: frozenset(),
+    ApplicationStatus.REJECTED: frozenset(),
+    ApplicationStatus.SKIPPED: frozenset(),
+}
+
+
+def can_transition(current: ApplicationStatus, target: ApplicationStatus) -> bool:
+    return target in APPLICATION_TRANSITIONS[current]
 
 
 class Application(BaseModel):

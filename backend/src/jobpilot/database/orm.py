@@ -7,18 +7,55 @@ domain enums happens in the repositories.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Index, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    Dialect,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    TypeDecorator,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class UTCDateTime(TypeDecorator[datetime]):
+    """Timezone-aware UTC datetimes on top of SQLite's naive storage.
+
+    SQLite has no timezone type: SQLAlchemy stores the wall-clock value and
+    returns naive datetimes, which crash arithmetic against ``datetime.now(UTC)``
+    and silently shift non-UTC inputs. Normalize to UTC on write and re-attach
+    UTC on read so the rest of the app only ever sees aware datetimes.
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, dialect: Dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)  # naive values are UTC by convention
+        return value.astimezone(UTC).replace(tzinfo=None)
+
+    def process_result_value(self, value: datetime | None, dialect: Dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
 
 class Base(DeclarativeBase):
     type_annotation_map = {
         dict[str, str]: JSON,
         list[str]: JSON,
-        datetime: DateTime(timezone=True),
+        datetime: UTCDateTime(),
     }
 
 

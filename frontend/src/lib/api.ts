@@ -87,10 +87,20 @@ export class ApiError extends Error {
   }
 }
 
+export function describeError(error: unknown): string {
+  if (error instanceof ApiError) return error.message;
+  return "Backend unreachable — is `jobpilot serve` running?";
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
+    // The API rejects state-changing requests without these (CSRF guard).
+    headers: {
+      "Content-Type": "application/json",
+      "X-JobPilot-Client": "dashboard",
+      ...init?.headers,
+    },
   });
   if (!response.ok) {
     let detail = response.statusText;
@@ -109,6 +119,7 @@ export interface ReviewItem {
   job_id: number;
   title: string;
   company: string;
+  source: string;
   application_url: string;
   status: string;
   cover_letter: string;
@@ -142,6 +153,8 @@ export const api = {
     request<{ status: string; detail: string }>(`/api/review/${id}/approve`, { method: "POST" }),
   rejectApplication: (id: number) =>
     request<{ status: string; detail: string }>(`/api/review/${id}/reject`, { method: "POST" }),
+  unapproveApplication: (id: number) =>
+    request<{ status: string; detail: string }>(`/api/review/${id}/unapprove`, { method: "POST" }),
   editMaterials: (id: number, data: { cover_letter?: string; answers?: Record<string, string> }) =>
     request<{ status: string; detail: string }>(`/api/review/${id}`, {
       method: "PATCH",

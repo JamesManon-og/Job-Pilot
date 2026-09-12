@@ -1,25 +1,19 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { api, ApiError, Job } from "@/lib/api";
+import { useCallback, useEffect, useState } from "react";
+import { api, Job } from "@/lib/api";
+import { useApi } from "@/lib/useApi";
 import { Card, ErrorNote, Loading, PageTitle, timeAgo } from "@/components/ui";
 
 export default function JobsPage() {
-  const [jobs, setJobs] = useState<Job[] | null>(null);
   const [search, setSearch] = useState("");
-  const [error, setError] = useState<string | null>(null);
-
+  const [query, setQuery] = useState("");
   useEffect(() => {
-    const timer = setTimeout(async () => {
-      try {
-        setJobs(await api.jobs({ search: search || undefined, limit: 100 }));
-        setError(null);
-      } catch (e) {
-        setError(e instanceof ApiError ? e.message : "Backend unreachable");
-      }
-    }, 250);
+    const timer = setTimeout(() => setQuery(search.trim()), 250);
     return () => clearTimeout(timer);
   }, [search]);
+  const fetchJobs = useCallback(() => api.jobs({ search: query || undefined, limit: 100 }), [query]);
+  const { data: jobs, error, loading } = useApi(fetchJobs);
 
   return (
     <div className="mx-auto max-w-6xl">
@@ -33,9 +27,9 @@ export default function JobsPage() {
         className="mb-4 w-full max-w-md rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm outline-none placeholder:text-zinc-600 focus:border-zinc-600"
       />
 
-      {!jobs && !error ? <Loading /> : null}
+      {loading ? <Loading /> : null}
       {jobs ? (
-        <Card className="p-0">
+        <Card className="overflow-x-auto p-0">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-zinc-800 text-left text-xs uppercase tracking-wide text-zinc-500">
@@ -77,11 +71,7 @@ export default function JobsPage() {
                       ) : null}
                     </div>
                   </td>
-                  <td className="px-4 py-2 text-zinc-400">
-                    {job.salary_min && job.salary_max
-                      ? `$${(job.salary_min / 1000).toFixed(0)}k–$${(job.salary_max / 1000).toFixed(0)}k`
-                      : "—"}
-                  </td>
+                  <td className="px-4 py-2 text-zinc-400">{formatSalary(job)}</td>
                   <td className="px-4 py-2 text-zinc-500">{timeAgo(job.date_posted)}</td>
                 </tr>
               ))}
@@ -98,4 +88,12 @@ export default function JobsPage() {
       ) : null}
     </div>
   );
+}
+
+function formatSalary(job: Job): string {
+  const k = (n: number) => `$${Math.round(n / 1000)}k`;
+  if (job.salary_min && job.salary_max) return `${k(job.salary_min)}–${k(job.salary_max)}`;
+  if (job.salary_min) return `from ${k(job.salary_min)}`;
+  if (job.salary_max) return `up to ${k(job.salary_max)}`;
+  return job.salary_raw ?? "—";
 }
