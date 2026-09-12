@@ -218,6 +218,13 @@ cd backend
   run `npm ci` in `frontend/`. Needs Node 20+.
 - **Ollama not responding** — run `brew services start ollama`, then `ollama pull qwen3:8b`.
 - **Playwright browser missing** — run `.venv/bin/playwright install chromium`.
+- **A platform reports a "challenge"/bot check** — some boards (JobStreet via
+  Cloudflare) serve a challenge to headless browsers. Re-run with a visible
+  browser: `jobpilot search --platform jobstreet --headed`. JobPilot never
+  solves or bypasses a challenge; a visible browser simply isn't one.
+- **A platform says `needs_login` right after you logged in** — the login is
+  saved per platform profile; make sure no other JobPilot window holds it, then
+  run `jobpilot platforms` to re-check.
 - **"Another JobPilot pipeline run is already in progress"** — another scrape/match/run
   is running (the message has its pid). Locks are released automatically when a
   process exits, even if it crashed.

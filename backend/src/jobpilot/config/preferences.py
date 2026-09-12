@@ -96,6 +96,8 @@ class PlatformSettings(BaseModel):
     max_results_per_query: int | None = Field(default=None, ge=1, le=200)
     # Optional extra cap on top of the global max_applications_per_day.
     max_applications_per_day: int | None = Field(default=None, ge=1)
+    # Adapter-specific knobs, e.g. {"domain": "ph.jobstreet.com"}.
+    options: dict[str, str] = Field(default_factory=dict)
 
 
 def _default_platforms() -> dict[str, PlatformSettings]:

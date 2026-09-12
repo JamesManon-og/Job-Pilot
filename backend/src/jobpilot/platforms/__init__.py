@@ -2,7 +2,12 @@
 
 from jobpilot.config.preferences import UserPreferences
 from jobpilot.domain.enums import JobSource
-from jobpilot.platforms import remoteok  # noqa: F401 - imported so adapters self-register
+from jobpilot.platforms import (  # noqa: F401 - imported so adapters self-register
+    jobstreet,
+    linkedin,
+    onlinejobs,
+    remoteok,
+)
 from jobpilot.platforms.base import (
     ChallengeError,
     PlatformAdapter,

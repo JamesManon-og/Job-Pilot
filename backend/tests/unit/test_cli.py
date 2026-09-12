@@ -47,7 +47,10 @@ def test_apply_refuses_without_applicant_details(
 
 def test_unknown_source_is_a_clear_error(project: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["scrape", "--source", "monster"]) == 1
-    assert "Available: remoteok" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Unknown platform 'monster'" in out
+    for name in ("remoteok", "linkedin", "jobstreet", "onlinejobs"):
+        assert name in out
 
 
 @pytest.mark.parametrize("argv", [["rank", "--min-score", "150"], ["run", "--top", "0"]])
