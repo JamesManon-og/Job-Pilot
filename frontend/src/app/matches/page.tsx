@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { api, ApiError, RankedMatch } from "@/lib/api";
+import { useCallback, useState } from "react";
+import { api } from "@/lib/api";
+import { useApi } from "@/lib/useApi";
 import {
   Card,
   ErrorNote,
@@ -12,26 +13,13 @@ import {
 } from "@/components/ui";
 
 export default function MatchesPage() {
-  const [matches, setMatches] = useState<RankedMatch[] | null>(null);
   const [minScore, setMinScore] = useState(0);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    (async () => {
-      try {
-        setMatches(await api.matches(minScore, 100));
-        setError(null);
-      } catch (e) {
-        setError(
-          e instanceof ApiError && e.status === 409
-            ? "No active resume yet — run: jobpilot resume import <your.pdf>"
-            : e instanceof ApiError
-              ? e.message
-              : "Backend unreachable",
-        );
-      }
-    })();
-  }, [minScore]);
+  const fetchMatches = useCallback(() => api.matches(minScore, 100), [minScore]);
+  const { data: matches, error: rawError, loading } = useApi(fetchMatches);
+  const error =
+    rawError && rawError.includes("No active resume")
+      ? "No active resume yet — run: jobpilot resume import <your.pdf>"
+      : rawError;
 
   return (
     <div className="mx-auto max-w-5xl">
@@ -52,7 +40,7 @@ export default function MatchesPage() {
         <span className="tabular-nums">{minScore}</span>
       </div>
 
-      {!matches && !error ? <Loading /> : null}
+      {loading ? <Loading /> : null}
       <div className="space-y-3">
         {matches?.map(({ job, match, composite_score }) => (
           <Card key={match.id}>

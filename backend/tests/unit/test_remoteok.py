@@ -51,3 +51,48 @@ class TestParseEntry:
         assert job is not None
         assert job.salary_min is None
         assert job.date_posted is None
+
+
+class TestMalformedData:
+    """One broken listing must not kill the scrape (audit finding)."""
+
+    def test_non_string_fields_are_rejected_not_crashing(self) -> None:
+        """Bug: `(123).strip()` raised AttributeError inside the generator,
+        aborting every listing after it."""
+        assert _parse_entry({**FULL_ENTRY, "position": 123}) is None
+        assert _parse_entry({**FULL_ENTRY, "company": ["Acme"]}) is None
+
+    def test_tags_as_a_string_are_split_not_iterated(self) -> None:
+        """Bug: "python" became technologies ['p','y','t','h','o','n']."""
+        job = _parse_entry({**FULL_ENTRY, "tags": "python, react"})
+        assert job is not None
+        assert job.technologies == ["python", "react"]
+
+    def test_non_http_urls_are_rejected(self) -> None:
+        assert _parse_entry({**FULL_ENTRY, "url": "javascript:alert(1)", "apply_url": ""}) is None
+
+    async def test_scraper_skips_bad_entries_and_keeps_going(self) -> None:
+        import httpx
+
+        from jobpilot.scrapers import remoteok
+
+        payload = [
+            {"legal": "notice"},
+            {**FULL_ENTRY, "id": "1", "url": "https://remoteok.com/1"},
+            {**FULL_ENTRY, "id": "2", "position": {"nested": "junk"}},
+            "not even a dict",
+            {**FULL_ENTRY, "id": "3", "url": "https://remoteok.com/3", "epoch": 10**20},
+            {**FULL_ENTRY, "id": "4", "url": "https://remoteok.com/4"},
+        ]
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
+        original = remoteok.create_http_client
+        remoteok.create_http_client = lambda **_: httpx.AsyncClient(transport=transport)  # type: ignore[assignment]
+        try:
+            jobs = [job async for job in remoteok.RemoteOKScraper().scrape()]
+        finally:
+            remoteok.create_http_client = original  # type: ignore[assignment]
+        assert [j.application_url for j in jobs] == [
+            "https://remoteok.com/1",
+            "https://remoteok.com/3",
+            "https://remoteok.com/4",
+        ]

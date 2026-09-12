@@ -1,3 +1,3 @@
-from jobpilot.autofill.engine import AutofillEngine, FilledForm
+from jobpilot.autofill.engine import AutofillEngine, AutofillError, FilledForm, detect_blocker
 
-__all__ = ["AutofillEngine", "FilledForm"]
+__all__ = ["AutofillEngine", "AutofillError", "FilledForm", "detect_blocker"]

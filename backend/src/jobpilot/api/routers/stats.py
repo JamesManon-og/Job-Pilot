@@ -7,13 +7,8 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from jobpilot.api.deps import SessionDep
-from jobpilot.database.orm import (
-    ApplicationRow,
-    JobRow,
-    MatchResultRow,
-    ResumeRow,
-    ScrapeRunRow,
-)
+from jobpilot.database.orm import ApplicationRow, JobRow, ResumeRow, ScrapeRunRow
+from jobpilot.database.repositories import MatchResultRepository
 
 router = APIRouter(prefix="/api/stats", tags=["stats"])
 
@@ -31,12 +26,15 @@ class Stats(BaseModel):
 @router.get("", response_model=Stats)
 async def get_stats(session: SessionDep) -> Stats:
     total_jobs = (await session.scalar(select(func.count()).select_from(JobRow))) or 0
-    total_matched = (await session.scalar(select(func.count()).select_from(MatchResultRow))) or 0
-    strong_matches = (
-        await session.scalar(
-            select(func.count()).select_from(MatchResultRow).where(MatchResultRow.score >= 80)
-        )
-    ) or 0
+    # Matches are per resume; counting every resume's rows double-counts jobs.
+    active_resume_id = await session.scalar(
+        select(ResumeRow.id).where(ResumeRow.is_active.is_(True))
+    )
+    total_matched = strong_matches = 0
+    if active_resume_id is not None:
+        matches = MatchResultRepository(session)
+        total_matched = await matches.count_for_resume(active_resume_id)
+        strong_matches = await matches.count_for_resume(active_resume_id, min_score=80)
     resumes = (await session.scalar(select(func.count()).select_from(ResumeRow))) or 0
 
     status_rows = await session.execute(

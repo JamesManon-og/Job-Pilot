@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from jobpilot.database.orm import ScrapeRunRow
@@ -55,6 +55,27 @@ class ScrapeRunRepository:
         row.finished_at = utcnow()
         await self._session.flush()
         return _to_domain(row)
+
+    async def mark_interrupted(self, source: JobSource) -> int:
+        """Close RUNNING rows left behind by a crashed or killed process.
+
+        Only call this while holding the pipeline lock: at that point no other
+        scrape can be running, so every RUNNING row for the source is stale.
+        """
+        result = await self._session.execute(
+            update(ScrapeRunRow)
+            .where(
+                ScrapeRunRow.source == source.value,
+                ScrapeRunRow.status == ScrapeRunStatus.RUNNING.value,
+            )
+            .values(
+                status=ScrapeRunStatus.FAILED.value,
+                error="interrupted: the process exited before the scrape finished",
+                finished_at=utcnow(),
+            )
+        )
+        await self._session.flush()
+        return int(getattr(result, "rowcount", 0) or 0)
 
     async def list_recent(self, limit: int = 20) -> list[ScrapeRun]:
         rows = await self._session.scalars(

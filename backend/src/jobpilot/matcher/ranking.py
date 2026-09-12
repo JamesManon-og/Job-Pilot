@@ -44,7 +44,10 @@ def _recency_score(job: Job, *, now: datetime | None = None) -> float:
     if job.date_posted is None:
         return 0.5
     now = now or datetime.now(UTC)
-    age_days = max(0.0, (now - job.date_posted).total_seconds() / 86400)
+    posted = job.date_posted
+    if posted.tzinfo is None:  # scrapers may emit naive UTC datetimes
+        posted = posted.replace(tzinfo=UTC)
+    age_days = max(0.0, (now - posted).total_seconds() / 86400)
     if age_days <= 3:
         return 1.0
     if age_days >= 45:

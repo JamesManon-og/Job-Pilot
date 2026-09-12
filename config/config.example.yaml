@@ -1,0 +1,35 @@
+# JobPilot user preferences — copy to config/config.yaml and edit.
+# config.yaml is gitignored because it holds your personal details.
+# Every key is optional; defaults shown.
+
+min_match_score: 75            # `jobpilot run` only prepares jobs whose LLM score is >= this
+preferred_technologies: []     # e.g. [react, nextjs, typescript, tailwind, nodejs, postgresql]
+preferred_countries: []        # e.g. [Philippines, United States]; empty = anywhere
+preferred_salary_min: null     # annual USD; null = no minimum
+preferred_job_titles: []       # e.g. [frontend developer, full stack developer]
+remote_only: true
+blacklist_companies: []        # never scrape, prepare, or apply to these
+max_applications_per_day: 10   # hard cap on submissions (and forms open for submission) per local day
+resume_version: default
+cover_letter_template: default
+
+# Human approval is mandatory and only you click submit. The old
+# auto_submit_enabled / human_approval_enabled switches are ignored.
+
+# Your details for autofilling applications. Blank fields are left for you.
+applicant:
+  name: ""                     # required before `jobpilot apply`
+  email: ""                    # required before `jobpilot apply`
+  phone: ""
+  address: ""
+  city: ""
+  country: ""
+  portfolio_url: ""
+  github_url: ""
+  linkedin_url: ""
+  work_authorization: ""       # answer to "Are you authorized to work…?", e.g. "Yes"
+  requires_sponsorship: ""     # answer to "Will you require sponsorship?", e.g. "No"
+  salary_expectation: ""       # e.g. "$60,000"
+  available_start_date: ""     # e.g. "Immediately", "2 weeks"
+  years_experience: ""         # used only for the generic "years of experience" question
+  resume_file: ""              # PDF to upload; blank = the active imported resume

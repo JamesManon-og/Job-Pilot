@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html>
+<head><title>Tricky Application Form</title></head>
+<body>
+<h1>Apply: Senior Engineer</h1>
+<p>You'll work on two-factor authentication and write clean code every day.</p>
+<form id="application" onsubmit="window.__submitted = true; event.preventDefault();">
+  <!-- "name" fields that belong to someone/something else -->
+  <label for="company_name">Current company name</label>
+  <input id="company_name" name="company_name">
+  <label for="username">Username</label>
+  <input id="username" name="username">
+  <label for="ref_name">Reference name</label>
+  <input id="ref_name" name="reference_name">
+
+  <!-- Split name: must not both receive the full name -->
+  <label for="fn">First name *</label>
+  <input id="fn" name="first_name" required>
+  <label for="ln">Last name *</label>
+  <input id="ln" name="last_name" required>
+
+  <!-- Prefilled by the platform: must not be overwritten -->
+  <label for="em">Email</label>
+  <input id="em" type="email" name="email" value="prefilled@platform.test">
+
+  <!-- Label with no for=, as many ATS forms do it -->
+  <div class="field"><div class="label">Mobile phone</div><input name="q_12"></div>
+
+  <!-- ids that are invalid CSS selectors -->
+  <label for="1st-question">Why do you want to work here?</label>
+  <textarea id="1st-question"></textarea>
+  <label for="q[2]'x">Why are you qualified for this role?</label>
+  <textarea id="q[2]'x"></textarea>
+
+  <!-- Cover-letter upload comes first and also accepts PDF -->
+  <label for="cl_file">Cover letter (PDF)</label>
+  <input type="file" id="cl_file" accept=".pdf">
+  <label for="cv_file">Resume/CV</label>
+  <input type="file" id="cv_file" accept=".pdf,.docx">
+
+  <label for="auth">Are you legally authorized to work in this country?</label>
+  <select id="auth">
+    <option value="">Select…</option>
+    <option value="y">Yes</option>
+    <option value="n">No</option>
+  </select>
+
+  <fieldset>
+    <legend>Will you require visa sponsorship?</legend>
+    <label><input type="radio" name="sponsor" value="yes"> Yes</label>
+    <label><input type="radio" name="sponsor" value="no"> No</label>
+  </fieldset>
+
+  <!-- Sensitive: never touched -->
+  <label for="dob">Date of birth</label>
+  <input id="dob" name="dob">
+  <label for="gender">Gender</label>
+  <select id="gender"><option value="">--</option><option>Male</option><option>Female</option></select>
+  <label for="ssn">SSN</label>
+  <input id="ssn" name="ssn">
+  <label for="cur_sal">Current salary</label>
+  <input id="cur_sal" name="current_salary">
+
+  <!-- Unknown, required -->
+  <label for="why_rust">Describe your experience with Rust *</label>
+  <textarea id="why_rust" required></textarea>
+
+  <!-- Consent: never ticked -->
+  <label><input type="checkbox" id="consent" name="consent" required> I agree to the privacy policy</label>
+
+  <!-- Technology-specific years must not get the generic number -->
+  <label for="yrs_react">How many years of experience do you have with React?</label>
+  <input type="number" id="yrs_react">
+  <label for="yrs">Years of experience</label>
+  <input type="number" id="yrs">
+
+  <div id="dyn"></div>
+  <button type="submit" id="submit">Submit application</button>
+</form>
+<script>
+  // A field that only appears after the phone is typed (dynamic forms).
+  document.querySelector('[name="q_12"]').addEventListener('input', () => {
+    if (!document.getElementById('linkedin_dyn')) {
+      document.getElementById('dyn').innerHTML =
+        '<label for="linkedin_dyn">LinkedIn profile URL</label>' +
+        '<input id="linkedin_dyn" type="url">';
+    }
+  });
+</script>
+</body>
+</html>

@@ -2,7 +2,8 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
-.venv/
+.venv
+.venv.*
 venv/
 .mypy_cache/
 .ruff_cache/
@@ -21,3 +22,6 @@ node_modules/
 
 # OS
 .DS_Store
+
+# Personal details: track config/config.example.yaml instead
+config/config.yaml

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from jobpilot.domain.enums import MatchRecommendation
 from jobpilot.domain.models import Job, MatchResult, ResumeProfile
@@ -56,12 +57,33 @@ _SCHEMA = {
 }
 
 
+class MalformedMatchError(ValueError):
+    """The model's reply had no usable score; don't record a fake 0."""
+
+
+_SCORE_PATTERN = re.compile(r"-?\d+(?:\.\d+)?")
+
+
 def _clamp_score(value: object) -> int:
-    try:
-        score = int(value)  # type: ignore[call-overload]
-    except (TypeError, ValueError):
-        return 0
-    return max(0, min(100, int(score)))
+    """Coerce the model's score to 0-100: accepts 85, 85.4, "85", "85%", "85/100"."""
+    if isinstance(value, bool):
+        raise MalformedMatchError(f"score is a boolean: {value!r}")
+    if isinstance(value, int | float):
+        score = float(value)
+    elif isinstance(value, str) and (found := _SCORE_PATTERN.search(value)):
+        score = float(found.group())
+    else:
+        raise MalformedMatchError(f"no numeric score in model output: {value!r}")
+    return max(0, min(100, round(score)))
+
+
+def _as_str_list(value: object) -> list[str]:
+    """Models sometimes return "react, node" instead of ["react", "node"]."""
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [part.strip() for part in re.split(r"[,;\n]", value) if part.strip()]
+    return []
 
 
 def _coerce_recommendation(value: object, score: int) -> MatchRecommendation:
@@ -104,8 +126,8 @@ class MatchEngine:
             job_id=job.id,
             resume_id=resume_id,
             score=score,
-            matched_skills=[str(s) for s in raw.get("matched_skills") or []],
-            missing_skills=[str(s) for s in raw.get("missing_skills") or []],
+            matched_skills=_as_str_list(raw.get("matched_skills")),
+            missing_skills=_as_str_list(raw.get("missing_skills")),
             recommendation=_coerce_recommendation(raw.get("recommendation"), score),
             reasoning=str(raw.get("reasoning") or ""),
             llm_model=self._model_name,

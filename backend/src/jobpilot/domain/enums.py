@@ -46,6 +46,9 @@ class ExperienceLevel(StrEnum):
 class ApplicationStatus(StrEnum):
     PENDING_REVIEW = "pending_review"
     APPROVED = "approved"
+    # Form opened and autofilled in a visible browser; waiting for the human to
+    # submit it themselves and confirm. Counts toward the daily cap.
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
     SUBMITTED = "submitted"
     FAILED = "failed"
     REJECTED = "rejected"

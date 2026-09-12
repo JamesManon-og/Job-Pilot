@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { api, ApiError, ScrapeRun, Stats } from "@/lib/api";
+import { api, describeError, ScrapeRun, Stats } from "@/lib/api";
 import {
   Button,
   Card,
@@ -17,7 +17,11 @@ export default function OverviewPage() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [runs, setRuns] = useState<ScrapeRun[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // Kept separate from `error`: the 5s poll clears polling errors, and used to
+  // wipe a failed action's message before you could read it.
+  const [actionError, setActionError] = useState<string | null>(null);
   const [actionNote, setActionNote] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -26,11 +30,7 @@ export default function OverviewPage() {
       setRuns(runsData);
       setError(null);
     } catch (e) {
-      setError(
-        e instanceof ApiError
-          ? e.message
-          : "Backend unreachable — is `jobpilot serve` running?",
-      );
+      setError(describeError(e));
     }
   }, []);
 
@@ -45,12 +45,17 @@ export default function OverviewPage() {
   }, [refresh]);
 
   const act = async (fn: () => Promise<{ detail: string }>) => {
+    setBusy(true);
+    setActionError(null);
+    setActionNote(null);
     try {
       const result = await fn();
       setActionNote(result.detail);
       setTimeout(refresh, 1500);
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e));
+      setActionError(describeError(e));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -61,14 +66,17 @@ export default function OverviewPage() {
       <div className="flex items-start justify-between">
         <PageTitle title="Overview" subtitle="Your local job pipeline at a glance." />
         <div className="flex gap-2">
-          <Button onClick={() => act(api.triggerScrape)}>Scrape now</Button>
-          <Button variant="ghost" onClick={() => act(api.triggerMatch)}>
+          <Button onClick={() => act(api.triggerScrape)} disabled={busy}>
+            Scrape now
+          </Button>
+          <Button variant="ghost" onClick={() => act(api.triggerMatch)} disabled={busy}>
             Match now
           </Button>
         </div>
       </div>
 
       {error ? <ErrorNote error={error} /> : null}
+      {actionError ? <ErrorNote error={actionError} /> : null}
       {actionNote ? <p className="mb-4 text-sm text-emerald-400">✓ {actionNote}</p> : null}
 
       {!stats && !error ? <Loading /> : null}
@@ -77,12 +85,12 @@ export default function OverviewPage() {
         <>
           <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
             <StatCard label="Jobs scraped" value={stats.total_jobs} />
-            <StatCard label="Jobs matched" value={stats.total_matched} />
+            <StatCard label="Jobs matched" value={stats.total_matched} hint="for the active resume" />
             <StatCard label="Strong matches" value={stats.strong_matches} hint="LLM score ≥ 80" />
             <StatCard
               label="Applications"
               value={Object.values(apps).reduce((a, b) => a + b, 0)}
-              hint={`${apps.submitted ?? 0} submitted · ${apps.pending_review ?? 0} pending`}
+              hint={`${apps.pending_review ?? 0} to review · ${apps.approved ?? 0} approved · ${apps.submitted ?? 0} submitted`}
             />
           </div>
 

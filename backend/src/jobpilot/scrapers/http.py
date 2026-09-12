@@ -44,6 +44,18 @@ class RateLimiter:
             self._last_request = time.monotonic()
 
 
+MAX_RETRY_AFTER_SECONDS = 120.0
+
+
+def _retry_after_seconds(response: httpx.Response) -> float:
+    """Honor a 429/503 Retry-After (seconds form), capped so a hostile value can't hang us."""
+    raw = response.headers.get("retry-after", "").strip()
+    try:
+        return min(max(float(raw), 0.0), MAX_RETRY_AFTER_SECONDS)
+    except ValueError:
+        return 0.0  # HTTP-date form or garbage: fall back to exponential backoff
+
+
 async def get_with_retry(
     client: httpx.AsyncClient,
     url: str,
@@ -75,6 +87,8 @@ async def get_with_retry(
             last_error = exc
             if attempt < attempts - 1:
                 delay = backoff_seconds * (2**attempt)
+                if isinstance(exc, httpx.HTTPStatusError):
+                    delay = max(delay, _retry_after_seconds(exc.response))
                 logger.warning("GET %s failed (%s); retrying in %.1fs", url, exc, delay)
                 await asyncio.sleep(delay)
     assert last_error is not None
