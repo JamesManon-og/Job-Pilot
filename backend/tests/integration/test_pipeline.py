@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import Iterator
 from typing import Any, ClassVar
 
 import pytest
@@ -17,11 +17,11 @@ from jobpilot.database.repositories import (
     MatchResultRepository,
     ResumeRepository,
 )
-from jobpilot.domain import Job, JobSource, RemoteType, Resume, ScrapeRunStatus
+from jobpilot.domain import JobSource, Resume, ScrapeRunStatus
 from jobpilot.llm import OllamaUnavailableError
 from jobpilot.pipeline import PipelineService
-from jobpilot.scrapers.base import BaseScraper
-from jobpilot.scrapers.registry import _REGISTRY
+from jobpilot.platforms import SearchRunner
+from tests.fakes import FakeAdapter, make_job
 
 PREFS = dict(
     applicant=ApplicantProfile(name="James Manon", email="j@example.com"),
@@ -30,44 +30,22 @@ PREFS = dict(
 )
 
 
-def make_job(i: int, company: str = "Acme") -> Job:
-    return Job(
-        title=f"Engineer {i}",
-        company=f"{company}{i}",
-        application_url=f"https://jobs.test/{company}/{i}",
-        source=JobSource.OTHER,
-        remote=RemoteType.REMOTE,
-        description=f"Build thing {i}",
-    )
+class Feed(FakeAdapter):
+    """The pipeline's job source for these tests (an API-style platform)."""
 
 
-class FakeScraper(BaseScraper):
-    source: ClassVar[JobSource] = JobSource.OTHER
-    jobs: ClassVar[list[Job]] = []
-
-    async def scrape(self) -> AsyncIterator[Job]:
-        for job in self.jobs:
-            yield job
+class BrokenAdapter(FakeAdapter):
+    platform: ClassVar[JobSource] = JobSource.LEVER
 
 
-class BrokenScraper(BaseScraper):
-    source: ClassVar[JobSource] = JobSource.LEVER
-
-    async def scrape(self) -> AsyncIterator[Job]:
-        raise RuntimeError("HTTP 503 from lever")
-        yield  # pragma: no cover - makes this an async generator
+FEED = Feed()
 
 
 @pytest.fixture(autouse=True)
-def registry() -> Iterator[None]:
-    saved = dict(_REGISTRY)
-    _REGISTRY.clear()
-    _REGISTRY[JobSource.OTHER] = FakeScraper
-    _REGISTRY[JobSource.LEVER] = BrokenScraper
-    FakeScraper.jobs = []
+def reset_feed() -> Iterator[None]:
+    FEED.jobs = []
+    FEED.enriched = []
     yield
-    _REGISTRY.clear()
-    _REGISTRY.update(saved)
 
 
 class ScoringLLM:
@@ -102,11 +80,17 @@ async def with_resume(engine: AsyncEngine) -> None:
 
 
 def pipeline(engine: AsyncEngine, llm: object | None, **prefs: Any) -> PipelineService:
-    return PipelineService(
-        create_session_factory(engine),
-        UserPreferences(**{**PREFS, **prefs}),
-        llm=llm,  # type: ignore[arg-type]
+    factory = create_session_factory(engine)
+    preferences = UserPreferences(**{**PREFS, **prefs})
+    search = SearchRunner(
+        factory,
+        preferences,
+        adapters={
+            JobSource.OTHER: FEED,
+            JobSource.LEVER: BrokenAdapter(raise_in_search=RuntimeError("HTTP 503 from lever")),
+        },
     )
+    return PipelineService(factory, preferences, llm=llm, search=search)  # type: ignore[arg-type]
 
 
 class TestPipeline:
@@ -117,19 +101,19 @@ class TestPipeline:
         assert report.stopped_early is None
 
     async def test_ollama_offline_still_scrapes(self, engine: AsyncEngine) -> None:
-        FakeScraper.jobs = [make_job(1)]
+        FEED.jobs = [make_job(1)]
         report = await pipeline(engine, None).run([JobSource.OTHER])
         assert report.new_jobs == 1
         assert report.stopped_early and "LLM unavailable" in report.stopped_early
 
     async def test_no_resume(self, engine: AsyncEngine) -> None:
-        FakeScraper.jobs = [make_job(1)]
+        FEED.jobs = [make_job(1)]
         report = await pipeline(engine, ScoringLLM()).run([JobSource.OTHER])
         assert report.stopped_early and "No active resume" in report.stopped_early
 
     async def test_one_failing_source_does_not_stop_the_others(self, engine: AsyncEngine) -> None:
         await with_resume(engine)
-        FakeScraper.jobs = [make_job(1)]
+        FEED.jobs = [make_job(1)]
         report = await pipeline(engine, ScoringLLM()).run([JobSource.LEVER, JobSource.OTHER])
         statuses = {run.source: run.status for run in report.scrape_runs}
         assert statuses == {
@@ -142,7 +126,7 @@ class TestPipeline:
         """Bug: min_match_score was never read; `run` prepared the top N no
         matter how badly they scored."""
         await with_resume(engine)
-        FakeScraper.jobs = [make_job(1), make_job(2)]
+        FEED.jobs = [make_job(1), make_job(2)]
         llm = ScoringLLM({1: 30, 2: 74})
         report = await pipeline(engine, llm, min_match_score=75).run([JobSource.OTHER], top=5)
         assert report.scored == 2
@@ -150,7 +134,7 @@ class TestPipeline:
 
     async def test_cli_min_score_can_only_raise_the_threshold(self, engine: AsyncEngine) -> None:
         await with_resume(engine)
-        FakeScraper.jobs = [make_job(1)]
+        FEED.jobs = [make_job(1)]
         report = await pipeline(engine, ScoringLLM({1: 60}), min_match_score=50).run(
             [JobSource.OTHER], min_score=0
         )
@@ -162,7 +146,7 @@ class TestPipeline:
         """Bug: ranked() included already-applied jobs, so run #2 re-tried the same
         top N, hit "already applied" for each, and prepared nothing — forever."""
         await with_resume(engine)
-        FakeScraper.jobs = [make_job(i) for i in range(1, 5)]
+        FEED.jobs = [make_job(i) for i in range(1, 5)]
         llm = ScoringLLM({1: 95, 2: 90, 3: 85, 4: 80})
         first = await pipeline(engine, llm).run([JobSource.OTHER], top=2)
         second = await pipeline(engine, llm).run([JobSource.OTHER], top=2)
@@ -176,7 +160,7 @@ class TestPipeline:
 
     async def test_rerunning_creates_no_duplicates(self, engine: AsyncEngine) -> None:
         await with_resume(engine)
-        FakeScraper.jobs = [make_job(1), make_job(1), make_job(2)]  # duplicate listing
+        FEED.jobs = [make_job(1), make_job(1), make_job(2)]  # duplicate listing
         for _ in range(3):
             await pipeline(engine, ScoringLLM()).run([JobSource.OTHER], top=5)
         async with create_session_factory(engine)() as session:
@@ -186,7 +170,7 @@ class TestPipeline:
 
     async def test_ollama_crash_mid_matching_keeps_progress(self, engine: AsyncEngine) -> None:
         await with_resume(engine)
-        FakeScraper.jobs = [make_job(i) for i in range(1, 6)]
+        FEED.jobs = [make_job(i) for i in range(1, 6)]
         report = await pipeline(engine, ScoringLLM(die_after=2)).run([JobSource.OTHER])
         assert report.scored == 2
         assert report.stopped_early and "Matching stopped" in report.stopped_early
@@ -198,7 +182,7 @@ class TestPipeline:
 
     async def test_daily_cap_stops_preparation(self, engine: AsyncEngine) -> None:
         await with_resume(engine)
-        FakeScraper.jobs = [make_job(i) for i in range(1, 4)]
+        FEED.jobs = [make_job(i) for i in range(1, 4)]
         svc = pipeline(engine, ScoringLLM(), max_applications_per_day=1)
         first = await svc.run([JobSource.OTHER], top=1)
         app_id = first.prepared[0]
@@ -217,7 +201,7 @@ class TestPipeline:
 
     async def test_hundreds_of_jobs(self, engine: AsyncEngine) -> None:
         await with_resume(engine)
-        FakeScraper.jobs = [make_job(i) for i in range(1, 301)]
+        FEED.jobs = [make_job(i) for i in range(1, 301)]
         started = time.perf_counter()
         report = await pipeline(engine, ScoringLLM({i: i % 100 for i in range(1, 301)})).run(
             [JobSource.OTHER], top=5, match_limit=300

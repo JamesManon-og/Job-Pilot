@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:8b"
     log_level: str = "INFO"
+    # Playwright browser for platform sessions: None = bundled Chromium,
+    # "chrome" = your installed Google Chrome (some sites' SSO prefer it).
+    browser_channel: str | None = None
 
     @model_validator(mode="after")
     def _derive_defaults(self) -> Settings:
@@ -81,6 +84,10 @@ class Settings(BaseSettings):
     @property
     def locks_dir(self) -> Path:
         return self.data_dir / "locks"
+
+    @property
+    def profiles_dir(self) -> Path:
+        return self.data_dir / "browser-profiles"
 
     @property
     def backend_dir(self) -> Path:

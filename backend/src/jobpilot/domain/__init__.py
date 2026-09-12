@@ -3,20 +3,22 @@ from jobpilot.domain.enums import (
     EmploymentType,
     ExperienceLevel,
     JobSource,
+    JobStatus,
     MatchRecommendation,
     RemoteType,
     ScrapeRunStatus,
+    SessionStatus,
 )
 from jobpilot.domain.models import (
     APPLICATION_TRANSITIONS,
     Application,
     Job,
     MatchResult,
+    PlatformSession,
     Resume,
     ResumeProfile,
     ScrapeRun,
     can_transition,
-    compute_dedup_hash,
 )
 
 __all__ = [
@@ -27,13 +29,15 @@ __all__ = [
     "ExperienceLevel",
     "Job",
     "JobSource",
+    "JobStatus",
     "MatchRecommendation",
     "MatchResult",
+    "PlatformSession",
     "RemoteType",
     "Resume",
     "ResumeProfile",
     "ScrapeRun",
     "ScrapeRunStatus",
+    "SessionStatus",
     "can_transition",
-    "compute_dedup_hash",
 ]

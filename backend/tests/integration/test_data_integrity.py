@@ -7,20 +7,16 @@ application_url index, and scrape runs left in RUNNING forever.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
-from typing import ClassVar
 
-import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from jobpilot.config.preferences import RankingWeights, UserPreferences
+from jobpilot.config.preferences import RankingWeights
 from jobpilot.database import create_session_factory
 from jobpilot.database.repositories import (
     JobRepository,
     MatchResultRepository,
     ResumeRepository,
-    ScrapeRunRepository,
 )
 from jobpilot.domain import (
     Job,
@@ -29,12 +25,8 @@ from jobpilot.domain import (
     MatchResult,
     RemoteType,
     Resume,
-    ScrapeRunStatus,
 )
 from jobpilot.matcher.ranking import rank_jobs
-from jobpilot.scrapers.base import BaseScraper
-from jobpilot.scrapers.registry import _REGISTRY
-from jobpilot.scrapers.runner import ScrapeRunner
 
 
 def _job(title: str = "Engineer", url: str = "https://a.com/j/1", **kwargs: object) -> Job:
@@ -142,73 +134,73 @@ class TestJobUpsertIdentity:
             assert await repo.count() == 1
 
 
-class _ScraperYieldingConflicts(BaseScraper):
-    source: ClassVar[JobSource] = JobSource.OTHER
+class TestJobStatusFollowsThePipeline:
+    async def test_status_moves_with_matching_and_applications(self, engine: AsyncEngine) -> None:
+        from jobpilot.database.repositories import ApplicationRepository
+        from jobpilot.domain import Application, ApplicationStatus, JobStatus
 
-    async def scrape(self) -> AsyncIterator[Job]:
-        yield _job(title="A", url="https://a.com/1")
-        yield _job(title="B", url="https://a.com/2")
-        yield _job(title="C", url="https://a.com/3")
-
-
-@pytest.fixture
-def conflicting_scraper() -> Iterator[None]:
-    previous = _REGISTRY.pop(JobSource.OTHER, None)
-    _REGISTRY[JobSource.OTHER] = _ScraperYieldingConflicts
-    yield
-    _REGISTRY.pop(JobSource.OTHER, None)
-    if previous is not None:
-        _REGISTRY[JobSource.OTHER] = previous
-
-
-class TestScrapeRunnerResilience:
-    async def test_database_error_on_one_listing_does_not_kill_the_run(
-        self, engine: AsyncEngine, conflicting_scraper: None, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Bug: one IntegrityError poisoned the session; finish() then raised
-        PendingRollbackError and the run stayed RUNNING forever."""
-        from jobpilot.database.orm import JobRow
-        from jobpilot.database.repositories.jobs import _apply_to_row
-
-        original = JobRepository.upsert
-
-        async def flaky_upsert(self: JobRepository, job: Job) -> tuple[Job, bool]:
-            if job.title == "B":
-                # Real failure mode: a flush-time IntegrityError that leaves the
-                # session needing a rollback (duplicate of A's dedup_hash).
-                row = JobRow()
-                _apply_to_row(_job(title="A", url="https://a.com/dup"), row)
-                row.dedup_hash = _job(title="A", url="https://a.com/1").dedup_hash
-                self._session.add(row)
-                await self._session.flush()
-            return await original(self, job)
-
-        monkeypatch.setattr(JobRepository, "upsert", flaky_upsert)
-        factory = create_session_factory(engine)
-        run = await ScrapeRunner(factory, UserPreferences(remote_only=False)).run(JobSource.OTHER)
-
-        assert run.status is ScrapeRunStatus.COMPLETED
-        assert run.jobs_found == 3
-        assert run.jobs_new == 2  # A and C persisted despite B failing
-        assert run.finished_at is not None
-        async with factory() as session:
-            assert await JobRepository(session).count() == 2
-
-    async def test_interrupted_runs_are_marked_failed_on_next_run(
-        self, engine: AsyncEngine, conflicting_scraper: None
-    ) -> None:
-        """Bug: 6 scrape_runs rows in the real DB were stuck in RUNNING."""
         factory = create_session_factory(engine)
         async with factory() as session:
-            stale = await ScrapeRunRepository(session).start(JobSource.OTHER)
+            jobs = JobRepository(session)
+            job, _ = await jobs.upsert(_job())
+            resume = await ResumeRepository(session).add(
+                Resume(version="v1", file_path="/r.pdf", is_active=True)
+            )
+            assert job.id is not None and resume.id is not None
+            assert job.status is JobStatus.DISCOVERED
+
+            await MatchResultRepository(session).upsert(
+                MatchResult(
+                    job_id=job.id,
+                    resume_id=resume.id,
+                    score=80,
+                    recommendation=MatchRecommendation.APPLY,
+                )
+            )
+            assert (await jobs.get(job.id)).status is JobStatus.MATCHED  # type: ignore[union-attr]
+
+            apps = ApplicationRepository(session)
+            app = await apps.create(Application(job_id=job.id, resume_id=resume.id))
+            assert app.id is not None
+            assert (await jobs.get(job.id)).status is JobStatus.PREPARED  # type: ignore[union-attr]
+            for step in (
+                ApplicationStatus.APPROVED,
+                ApplicationStatus.AWAITING_CONFIRMATION,
+                ApplicationStatus.SUBMITTED,
+            ):
+                await apps.transition(app.id, step)
+            assert (await jobs.get(job.id)).status is JobStatus.APPLIED  # type: ignore[union-attr]
+
+            # Re-scoring an applied job never demotes it.
+            await MatchResultRepository(session).upsert(
+                MatchResult(
+                    job_id=job.id,
+                    resume_id=resume.id,
+                    score=10,
+                    recommendation=MatchRecommendation.SKIP,
+                )
+            )
+            assert (await jobs.get(job.id)).status is JobStatus.APPLIED  # type: ignore[union-attr]
+
+    async def test_duplicates_are_never_scored(self, engine: AsyncEngine) -> None:
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            jobs = JobRepository(session)
+            original, _ = await jobs.upsert(_job(title="React Developer", url="https://a.com/1"))
+            dup, _ = await jobs.upsert(
+                Job(
+                    title="React Developer (Remote)",
+                    company="ACME Inc.",
+                    application_url="https://b.com/9",
+                    source=JobSource.LINKEDIN,
+                    external_id="9",
+                )
+            )
+            resume = await ResumeRepository(session).add(
+                Resume(version="v1", file_path="/r.pdf", is_active=True)
+            )
             await session.commit()
-
-        await ScrapeRunner(factory, UserPreferences(remote_only=False)).run(JobSource.OTHER)
-
         async with factory() as session:
-            runs = await ScrapeRunRepository(session).list_recent()
-        by_id = {run.id: run for run in runs}
-        assert by_id[stale.id].status is ScrapeRunStatus.FAILED
-        assert by_id[stale.id].error is not None
-        assert "interrupted" in by_id[stale.id].error
-        assert by_id[stale.id].finished_at is not None
+            todo = await MatchResultRepository(session).unmatched_job_ids(resume.id)  # type: ignore[arg-type]
+        assert todo == [original.id]
+        assert dup.id not in todo

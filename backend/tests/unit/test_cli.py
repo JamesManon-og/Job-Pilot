@@ -86,3 +86,35 @@ def test_prompt_key_hints_are_visible(monkeypatch: pytest.MonkeyPatch) -> None:
     text = recorded.export_text()
     for hint in ("[s] I submitted it", "[f] fill", "[k] keep", "[r] reject", "[q] quit"):
         assert hint in text
+
+
+def test_platforms_lists_every_adapter(project: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["db", "init"]) == 0
+    assert cli.main(["platforms"]) == 0
+    out = capsys.readouterr().out
+    assert "remoteok" in out and "not needed" in out
+
+
+def test_pause_blocks_new_runs_until_unpaused(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["pause", "going", "offline"]) == 0
+    assert cli.main(["search"]) == cli.EXIT_PAUSED
+    assert cli.main(["run"]) == cli.EXIT_PAUSED
+    assert "jobpilot unpause" in capsys.readouterr().out
+    assert cli.main(["unpause"]) == 0
+    assert not (project / "data" / "PAUSED").exists()
+
+
+def test_login_for_platform_without_accounts(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["login", "remoteok"]) == 0
+    assert "doesn't need an account" in capsys.readouterr().out
+    assert cli.main(["login", "myspace"]) == 1
+
+
+def test_logout_without_saved_profile(project: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["db", "init"]) == 0
+    assert cli.main(["logout", "remoteok", "--yes"]) == 0
+    assert "No saved remoteok login" in capsys.readouterr().out
